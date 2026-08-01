@@ -1133,18 +1133,18 @@ pub fn sidebarTabKindIcon(tab_state: *const tab.TabState) u32 {
     };
 }
 
-/// Allocate a 五行 terminal icon index (0–4) by counting existing terminal
-/// tabs and cycling: 0,1,2,3,4,0,1,2,…  This is a simple round-robin —
-/// duplicate icons may appear after closing and re-creating tabs, but the
-/// assignment is deterministic and easy to reason about.
+/// Allocate a 五行 terminal icon index (0–4) by counting terminal tabs
+/// that already have an icon assigned, then cycling: 0,1,2,3,4,0,1,2,…
+/// Only counts tabs whose `terminal_icon != null` — the tab being assigned
+/// right now has `terminal_icon == null` so it is excluded from the count.
 fn allocateTerminalIcon() u8 {
-    var terminal_count: u8 = 0;
+    var assigned: u8 = 0;
     for (tab.g_tabs[0..tab.g_tab_count]) |maybe_tab| {
         if (maybe_tab) |t| {
-            if (t.kind == .terminal) terminal_count += 1;
+            if (t.kind == .terminal and t.terminal_icon != null) assigned += 1;
         }
     }
-    return @intCast(@as(usize, terminal_count) % 5);
+    return @intCast(@as(usize, assigned) % 5);
 }
 
 /// Terminal tab icon from the 五行 emoji series.
