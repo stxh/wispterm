@@ -1133,28 +1133,17 @@ pub fn sidebarTabKindIcon(tab_state: *const tab.TabState) u32 {
     };
 }
 
-/// Allocate the next 五行 terminal icon index.
-/// Scans all active tabs and returns the first icon not currently in use.
-/// When all 5 are in use, cycles based on total terminal tab count so that
-/// tabs 6,7,8… get icons 1,2,3… instead of all getting icon 0.
+/// Allocate a 五行 terminal icon index (0–4) by counting existing terminal
+/// tabs and cycling: 0,1,2,3,4,0,1,2,…  This is a simple round-robin —
+/// duplicate icons may appear after closing and re-creating tabs, but the
+/// assignment is deterministic and easy to reason about.
 fn allocateTerminalIcon() u8 {
-    var in_use: [5]bool = .{false} ** 5;
     var terminal_count: u8 = 0;
     for (tab.g_tabs[0..tab.g_tab_count]) |maybe_tab| {
         if (maybe_tab) |t| {
-            if (t.kind == .terminal) {
-                terminal_count += 1;
-                if (t.terminal_icon) |idx| {
-                    if (idx < 5) in_use[idx] = true;
-                }
-            }
+            if (t.kind == .terminal) terminal_count += 1;
         }
     }
-    // First, try to find a free index (handles gaps from closed tabs)
-    for (&in_use, 0..) |used, i| {
-        if (!used) return @intCast(i);
-    }
-    // All 5 in use — cycle based on total terminal tab count
     return @intCast(@as(usize, terminal_count) % 5);
 }
 
