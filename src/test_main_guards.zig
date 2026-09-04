@@ -550,7 +550,7 @@ test "app source guards" {
     }
     if (std.mem.indexOf(u8, overlays_source, ".codex") != null or
         std.mem.indexOf(u8, overlays_source, ".claude") != null or
-        std.mem.indexOf(u8, overlays_source, ".reasonix") != null or
+        std.mem.indexOf(u8, overlays_source, ".kimi-code") != null or
         std.mem.indexOf(u8, overlays_source, "parseMetadata") != null)
     {
         return guardFailed("renderer/overlays.zig must only launch AI History sources; provider scanning belongs in ai_history modules");

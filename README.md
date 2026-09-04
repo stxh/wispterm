@@ -36,7 +36,11 @@ English | [简体中文](README.zh-CN.md)
 - **AI Agent sessions** - launch OpenAI-compatible Agent tabs, configure profiles, restore history, export Markdown transcripts, and distill reusable local skills
 - **Command-center Copilot History** - search saved AI Chat and Copilot sidebar conversations, grouped by date, with source filters for sidebar vs tab sessions
 - **In-session model switching** - use `/model` or click the model label to move an active AI chat/Copilot session to another saved profile with a context summary handoff
-- **AI history browser** - browse local, WSL, and SSH Codex / Claude Code / Reasonix history and resume sessions from their original project directories
+- **Prompt queue** - prompts submitted while a Copilot request is running are queued and auto-sent in order when the session goes idle; review, reorder, edit, or drop them from the queue panel
+- **Send to Chat** - send the terminal selection (or recent output tail) to Copilot as a collapsible context card, via the command palette or a bindable `send_to_copilot` keybind action
+- **Fork session** - duplicate an AI conversation at any rewind point (rewind picker `f`, or whole-session from the command palette) to explore alternative approaches with shared history
+- **Workspace recipes** - save the current window's tab/split layout as a named recipe, restore it into a new window from the command palette, and export/import recipe JSON files to share setups
+- **AI history browser** - browse local, WSL, and SSH Codex / Claude Code / Kimi Code / OpenCode history and resume sessions from their original project directories
 - **Kitty Graphics protocol** - display inline images and PDFs from remote shells via `imgcat.py` / `pdfcat.py`
 - **Opt-in remote access** - share a session key over a Cloudflare-hosted relay (disabled by default)
 
@@ -53,7 +57,7 @@ English | [简体中文](README.zh-CN.md)
 ## Versions
 
 The desktop app version is the repository root version in `build.zig.zon`
-(currently `1.34.0`) and is what `wispterm --version`, release notes, desktop
+(currently `1.36.0`) and is what `wispterm --version`, release notes, desktop
 packages, and the command center `Version` entry use.
 
 The WispTerm Remote web console/relay under `remote/` has an independent npm/web
@@ -273,7 +277,7 @@ MIT
 
 ## Citation
 
-Xu, Z.-G. (2026). *WispTerm* (Version 1.34.0) [Computer software]. Zenodo.
+Xu, Z.-G. (2026). *WispTerm* (Version 1.36.0) [Computer software]. Zenodo.
 https://doi.org/10.5281/zenodo.20660541
 
 Copyable acknowledgment template:
@@ -283,6 +287,6 @@ We used WispTerm as part of our computational environment for life sciences data
 analysis, remote computing workflows, reproducible command-line processing, and
 the organization of related literature and analysis code.
 
-Xu, Z.-G. (2026). WispTerm (Version 1.34.0) [Computer software]. Zenodo.
+Xu, Z.-G. (2026). WispTerm (Version 1.36.0) [Computer software]. Zenodo.
 https://doi.org/10.5281/zenodo.20660541
 ```

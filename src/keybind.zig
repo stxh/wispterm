@@ -102,6 +102,7 @@ pub const Action = enum {
     focus_panel_9,
     open_settings,
     open_config,
+    send_to_copilot,
 
     pub fn parse(value: []const u8) ?Action {
         inline for (std.meta.fields(Action)) |field| {

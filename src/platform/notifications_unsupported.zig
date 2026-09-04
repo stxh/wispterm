@@ -5,6 +5,10 @@ const platform_window = @import("window.zig");
 
 pub fn bell() void {}
 
+pub fn bindWindow(handle: platform_window.NativeHandle) void {
+    _ = handle;
+}
+
 pub fn requestAttention(handle: platform_window.NativeHandle) void {
     _ = handle;
 }
@@ -19,3 +23,16 @@ pub fn notificationAuthStatus() u8 {
 }
 
 pub fn requestNotificationAuth() void {}
+
+pub fn handleCallback(
+    msg: platform_window.MessageId,
+    wparam: platform_window.WordParam,
+    lparam: platform_window.LongParam,
+) bool {
+    _ = msg;
+    _ = wparam;
+    _ = lparam;
+    return false;
+}
+
+pub fn cleanup() void {}

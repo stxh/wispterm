@@ -24,6 +24,7 @@ fn activeAppTestShard(comptime shard: AppTestShard) bool {
 comptime {
     if (activeAppTestShard(.assistant)) {
         _ = @import("assistant/conversation/session.zig");
+        _ = @import("assistant/conversation/session_fork_test.zig");
         _ = @import("assistant/conversation/request.zig");
         _ = @import("assistant/conversation/acp_turn.zig");
         _ = @import("assistant/conversation/model_switch.zig");
@@ -43,7 +44,7 @@ comptime {
         _ = @import("terminal_agents/sessions/types.zig");
         _ = @import("terminal_agents/sessions/provider_codex.zig");
         _ = @import("terminal_agents/sessions/provider_claude.zig");
-        _ = @import("terminal_agents/sessions/provider_reasonix.zig");
+        _ = @import("terminal_agents/sessions/provider_kimi.zig");
         _ = @import("terminal_agents/sessions/source.zig");
         _ = @import("terminal_agents/sessions/cache.zig");
         _ = @import("terminal_agents/sessions/resume.zig");
@@ -63,6 +64,7 @@ comptime {
         _ = @import("agent_tools/sessions.zig");
         _ = @import("agent_tools/access.zig");
         _ = @import("agent_tools/files.zig");
+        _ = @import("agent_tools/transfer.zig");
         _ = @import("agent_tools/exec.zig");
         _ = @import("agent_tools/dynamic.zig");
         _ = @import("agent_tools/weixin.zig");

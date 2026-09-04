@@ -13,6 +13,7 @@ const markdown_preview = @import("../preview/markdown.zig");
 const input_key = @import("../input/key.zig");
 const remote_client = @import("../remote_client.zig");
 const session_persist = @import("../session_persist.zig");
+const recipe_store = @import("../recipe/store.zig");
 const ai_chat = @import("../assistant/conversation/session.zig");
 const ai_history_session = @import("../terminal_agents/sessions/session.zig");
 const memory_center_session = @import("../memory_center/session.zig");
@@ -241,7 +242,7 @@ pub threadlocal var g_tabs: [MAX_TABS]?*TabState = .{null} ** MAX_TABS;
 pub threadlocal var g_tab_count: usize = 0;
 
 // Shell command for spawning new tabs (set once at startup from config)
-pub threadlocal var g_shell_cmd_buf: platform_pty_command.CommandLineBuffer = undefined;
+pub threadlocal var g_shell_cmd_buf: platform_pty_command.CommandLineBuffer = @splat(0);
 pub threadlocal var g_shell_cmd_len: usize = 0;
 pub threadlocal var g_scrollback_limit: u32 = 10_000_000;
 pub threadlocal var g_remote_client: ?*remote_client.Client = null;
@@ -2166,32 +2167,82 @@ pub fn restoreSessionFromFile(
 
     session_persist.normalize(&loaded.value);
 
-    var rebuilt: usize = 0;
-    for (loaded.value.tabs) |*snap| {
+    const result = restoreParsedSession(allocator, &loaded.value, cols, rows, cursor_style, cursor_blink);
+    return result.any();
+}
+
+pub const RestoreResult = struct {
+    /// Terminal/AI tabs rebuilt from the snapshot.
+    restored: usize = 0,
+    /// tmux control-mode sessions re-attached via their profile.
+    tmux_restored: usize = 0,
+    /// AI Chat / AI-history tabs skipped because their persisted session id is
+    /// gone from the history store (recipe shared to a machine without it).
+    ai_failed: usize = 0,
+
+    pub fn any(self: RestoreResult) bool {
+        return self.restored > 0 or self.tmux_restored > 0;
+    }
+};
+
+/// Restore a named-workspace recipe (bare Session v2 JSON) from an explicit
+/// path — used when a new window is spawned to host a recipe. Differences
+/// from restoreSessionFromFile: the file is never renamed to .bak when
+/// corrupt (recipes are user data, not the startup session), and local-shell
+/// cwds that no longer exist on this machine are dropped to the default
+/// directory instead of spawning a broken shell. Both differences are
+/// recipe-only; the startup-restore behavior above is unchanged.
+pub fn restoreSessionFromPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    cols: u16,
+    rows: u16,
+    cursor_style: CursorStyle,
+    cursor_blink: bool,
+) RestoreResult {
+    var loaded = recipe_store.loadRecipe(allocator, path) catch |err| {
+        std.debug.print("restoreSessionFromPath: load failed: {}\n", .{err});
+        return .{};
+    };
+    defer loaded.deinit();
+
+    _ = recipe_store.dropMissingLocalCwds(&loaded.value);
+
+    return restoreParsedSession(allocator, &loaded.value, cols, rows, cursor_style, cursor_blink);
+}
+
+fn restoreParsedSession(
+    allocator: std.mem.Allocator,
+    session: *const session_persist.Session,
+    cols: u16,
+    rows: u16,
+    cursor_style: CursorStyle,
+    cursor_blink: bool,
+) RestoreResult {
+    var result: RestoreResult = .{};
+    for (session.tabs) |*snap| {
         if (restoreTab(allocator, snap, cols, rows, cursor_style, cursor_blink)) {
-            rebuilt += 1;
+            result.restored += 1;
         } else {
-            std.debug.print("restoreSessionFromFile: skipping failed tab\n", .{});
+            if (snap.ai_session_id != null or snap.ai_history != null) result.ai_failed += 1;
+            std.debug.print("restoreParsedSession: skipping failed tab\n", .{});
         }
     }
 
     // Re-attach persisted tmux sessions (Phase 3d #4c): each profile re-connects
     // via the controller, which rebuilds its window-tabs from the live server.
-    var tmux_restored: usize = 0;
     if (g_tmux_restore_hook) |hook| {
-        for (loaded.value.tmux_profiles) |name| {
+        for (session.tmux_profiles) |name| {
             std.debug.print("tmux: restoring session for profile '{s}'\n", .{name});
-            if (hook(name)) tmux_restored += 1;
+            if (hook(name)) result.tmux_restored += 1;
         }
     }
 
-    if (rebuilt == 0 and tmux_restored == 0) return false;
-
-    if (rebuilt > 0) {
-        const target = @min(@as(usize, loaded.value.active_tab), rebuilt - 1);
+    if (result.restored > 0) {
+        const target = @min(@as(usize, session.active_tab), result.restored - 1);
         switchTab(target);
     }
-    return true;
+    return result;
 }
 
 fn resetTestTabGlobals() void {

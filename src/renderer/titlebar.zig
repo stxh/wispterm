@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const titlebar_layout = @import("titlebar_layout.zig");
+const chrome_icons = @import("chrome_icons.zig");
 const AppWindow = @import("../AppWindow.zig");
 const ui_pipeline = AppWindow.ui_pipeline;
 const font = AppWindow.font;
@@ -270,60 +271,22 @@ pub fn renderTextLimited(text: []const u8, x: f32, y: f32, color: [3]f32, max_w:
     return cursor_x;
 }
 
-fn renderFallbackMenuIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const line_w: f32 = 14;
-    const line_h: f32 = 1.5;
-    ui_pipeline.fillQuad(cx - line_w / 2, cy - 5, line_w, line_h, color);
-    ui_pipeline.fillQuad(cx - line_w / 2, cy, line_w, line_h, color);
-    ui_pipeline.fillQuad(cx - line_w / 2, cy + 5, line_w, line_h, color);
-}
-
-fn renderFallbackGearIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const stroke: f32 = 2;
-    const ring: f32 = 12;
-    const tooth: f32 = 4;
-
-    ui_pipeline.fillQuad(cx - ring / 2, cy - ring / 2, ring, stroke, color);
-    ui_pipeline.fillQuad(cx - ring / 2, cy + ring / 2 - stroke, ring, stroke, color);
-    ui_pipeline.fillQuad(cx - ring / 2, cy - ring / 2, stroke, ring, color);
-    ui_pipeline.fillQuad(cx + ring / 2 - stroke, cy - ring / 2, stroke, ring, color);
-
-    ui_pipeline.fillQuad(cx - stroke / 2, cy - ring / 2 - tooth, stroke, tooth, color);
-    ui_pipeline.fillQuad(cx - stroke / 2, cy + ring / 2, stroke, tooth, color);
-    ui_pipeline.fillQuad(cx - ring / 2 - tooth, cy - stroke / 2, tooth, stroke, color);
-    ui_pipeline.fillQuad(cx + ring / 2, cy - stroke / 2, tooth, stroke, color);
-}
-
-fn renderFallbackHelpIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
-    const ch: u32 = '?';
-    if (font.g_titlebar_cell_width > 0) {
-        const gw = titlebarGlyphAdvance(ch);
-        const gh = font.g_titlebar_cell_height;
-        const tx = x + (w - gw) / 2;
-        const ty = y + (h - gh) / 2;
-        renderTitlebarChar(ch, tx, ty, color);
+fn renderChromeIcon(kind: chrome_icons.Kind, x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
+    var buf: [chrome_icons.max_quads]chrome_icons.Quad = undefined;
+    const n = chrome_icons.fill(&buf, kind, x, y, w, h);
+    for (buf[0..n]) |q| {
+        ui_pipeline.fillQuad(q.x, q.y, q.w, q.h, color);
     }
 }
 
-/// A minimal speech-bubble icon (outline body + a small tail), matching the
-/// stroked style of the help/gear fallbacks. Vector so it is font-independent.
-fn renderFallbackCopilotIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const stroke: f32 = 2;
-    const bw: f32 = 16;
-    const bh: f32 = 11;
-    const bx = cx - bw / 2;
-    const by = cy - bh / 2 + 1;
-    ui_pipeline.fillQuad(bx, by, bw, stroke, color); // top
-    ui_pipeline.fillQuad(bx, by + bh - stroke, bw, stroke, color); // bottom
-    ui_pipeline.fillQuad(bx, by, stroke, bh, color); // left
-    ui_pipeline.fillQuad(bx + bw - stroke, by, stroke, bh, color); // right
-    ui_pipeline.fillQuad(bx + 3, by - 3, stroke, 3, color); // tail
+fn renderTitlebarIcon(icon: font_backend.TitlebarIcon, kind: chrome_icons.Kind, x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
+    if (font.icon_face != null) {
+        if (font.loadIconGlyph(font_backend.titlebarIconGlyph(icon))) |ch| {
+            renderIconGlyph(ch, x, y, w, h, color, 1.0);
+            return;
+        }
+    }
+    renderChromeIcon(kind, x, y, w, h, color);
 }
 
 fn renderPlusIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
@@ -334,12 +297,7 @@ fn renderPlusIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
         }
     }
 
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const arm: f32 = 5;
-    const t: f32 = 1.25;
-    ui_pipeline.fillQuad(cx - arm, cy - t / 2, arm * 2, t, color);
-    ui_pipeline.fillQuad(cx - t / 2, cy - arm, t, arm * 2, color);
+    renderChromeIcon(.add, x, y, w, h, color);
 }
 
 pub fn renderCloseIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
@@ -350,17 +308,7 @@ pub fn renderCloseIcon(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
         }
     }
 
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const arm: f32 = 4;
-    const t: f32 = 1;
-    const steps: usize = 20;
-    for (0..steps) |si| {
-        const frac = @as(f32, @floatFromInt(si)) / @as(f32, @floatFromInt(steps - 1));
-        const px = cx - arm + frac * arm * 2;
-        ui_pipeline.fillQuad(px - t / 2, (cy + arm - frac * arm * 2) - t / 2, t, t, color);
-        ui_pipeline.fillQuad(px - t / 2, (cy - arm + frac * arm * 2) - t / 2, t, t, color);
-    }
+    renderChromeIcon(.close, x, y, w, h, color);
 }
 
 /// Render a titlebar glyph at 1:1 atlas size (no scaling).
@@ -516,15 +464,7 @@ pub fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) vo
         if (toggle_hovered) {
             ui_pipeline.fillQuad(toggle_x, layout.top_y, TITLEBAR_TOGGLE_W, titlebar_h, hover_bg);
         }
-        if (font.icon_face != null) {
-            if (font.loadIconGlyph(0xE700)) |ch| {
-                renderIconGlyph(ch, toggle_x, layout.top_y, TITLEBAR_TOGGLE_W, titlebar_h, icon_color, 1.0);
-            } else {
-                renderFallbackMenuIcon(toggle_x, layout.top_y, TITLEBAR_TOGGLE_W, titlebar_h, icon_color);
-            }
-        } else {
-            renderFallbackMenuIcon(toggle_x, layout.top_y, TITLEBAR_TOGGLE_W, titlebar_h, icon_color);
-        }
+        renderTitlebarIcon(.menu, .menu, toggle_x, layout.top_y, TITLEBAR_TOGGLE_W, titlebar_h, icon_color);
 
         // File-explorer toggle button (folder icon) next to sidebar toggle
         const folder_x = layout.folder_x;
@@ -561,15 +501,7 @@ pub fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) vo
             if (config_hovered) {
                 ui_pipeline.fillQuad(config_x, layout.top_y, TITLEBAR_CONFIG_W, titlebar_h, hover_bg);
             }
-            if (font.icon_face != null) {
-                if (font.loadIconGlyph(0xE713)) |ch| {
-                    renderIconGlyph(ch, config_x, layout.top_y, TITLEBAR_CONFIG_W, titlebar_h, icon_color, 1.0);
-                } else {
-                    renderFallbackGearIcon(config_x, layout.top_y, TITLEBAR_CONFIG_W, titlebar_h, icon_color);
-                }
-            } else {
-                renderFallbackGearIcon(config_x, layout.top_y, TITLEBAR_CONFIG_W, titlebar_h, icon_color);
-            }
+            renderTitlebarIcon(.settings, .settings, config_x, layout.top_y, TITLEBAR_CONFIG_W, titlebar_h, icon_color);
         }
 
         const help_x = layout.help_x;
@@ -578,15 +510,7 @@ pub fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) vo
             if (help_hovered) {
                 ui_pipeline.fillQuad(help_x, layout.top_y, TITLEBAR_HELP_W, titlebar_h, hover_bg);
             }
-            if (font.icon_face != null) {
-                if (font.loadIconGlyph(0xEDA7)) |ch| {
-                    renderIconGlyph(ch, help_x, layout.top_y, TITLEBAR_HELP_W, titlebar_h, icon_color, 1.0);
-                } else {
-                    renderFallbackHelpIcon(help_x, layout.top_y, TITLEBAR_HELP_W, titlebar_h, icon_color);
-                }
-            } else {
-                renderFallbackHelpIcon(help_x, layout.top_y, TITLEBAR_HELP_W, titlebar_h, icon_color);
-            }
+            renderTitlebarIcon(.help, .help, help_x, layout.top_y, TITLEBAR_HELP_W, titlebar_h, icon_color);
         }
 
         const copilot_x = layout.copilot_x;
@@ -603,7 +527,7 @@ pub fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) vo
                 blend(bg, AppWindow.g_theme.cursor_color, 0.85) // active
             else
                 icon_color;
-            renderFallbackCopilotIcon(copilot_x, layout.top_y, TITLEBAR_COPILOT_W, titlebar_h, copilot_tint);
+            renderTitlebarIcon(.copilot, .copilot, copilot_x, layout.top_y, TITLEBAR_COPILOT_W, titlebar_h, copilot_tint);
         }
 
         if (tab.activeTab()) |active_tab| {
@@ -1507,54 +1431,13 @@ pub fn renderCaptionButton(button: titlebar_layout.CaptionButtonVisual) void {
         }
     }
 
-    // Fallback: quad-based icons
-    const cx = rect.x + rect.w / 2;
-    const cy = rect.y + rect.h / 2;
-
-    switch (button.icon) {
-        .close => {
-            const size: f32 = 5;
-            const steps: usize = 32;
-            const t: f32 = 1.5;
-            for (0..steps) |i| {
-                const frac = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps - 1));
-                const px = cx - size + frac * size * 2;
-                const py1 = cy + size - frac * size * 2;
-                ui_pipeline.fillQuad(px - t / 2, py1 - t / 2, t, t, icon_color);
-                const py2 = cy - size + frac * size * 2;
-                ui_pipeline.fillQuad(px - t / 2, py2 - t / 2, t, t, icon_color);
-            }
-        },
-        .maximize => {
-            const size: f32 = 5;
-            const t: f32 = 1;
-            ui_pipeline.fillQuad(cx - size, cy + size - t, size * 2, t, icon_color); // top
-            ui_pipeline.fillQuad(cx - size, cy - size, size * 2, t, icon_color); // bottom
-            ui_pipeline.fillQuad(cx - size, cy - size, t, size * 2, icon_color); // left
-            ui_pipeline.fillQuad(cx + size - t, cy - size, t, size * 2, icon_color); // right
-        },
-        .restore => {
-            const size: f32 = 4.5;
-            const t: f32 = 1;
-            const offset: f32 = 3;
-            const back_x = cx - size + offset;
-            const back_y = cy - size + offset;
-            ui_pipeline.fillQuad(back_x, back_y + size * 2 - t, size * 2, t, icon_color);
-            ui_pipeline.fillQuad(back_x + size * 2 - t, back_y, t, size * 2, icon_color);
-
-            const front_x = cx - size - offset / 2;
-            const front_y = cy - size - offset / 2;
-            ui_pipeline.fillQuad(front_x, front_y + size * 2 - t, size * 2, t, icon_color);
-            ui_pipeline.fillQuad(front_x, front_y, size * 2, t, icon_color);
-            ui_pipeline.fillQuad(front_x, front_y, t, size * 2, icon_color);
-            ui_pipeline.fillQuad(front_x + size * 2 - t, front_y, t, size * 2, icon_color);
-        },
-        .minimize => {
-            const size: f32 = 5;
-            const t: f32 = 1;
-            ui_pipeline.fillQuad(cx - size, cy - t / 2, size * 2, t, icon_color);
-        },
-    }
+    const kind: chrome_icons.Kind = switch (button.icon) {
+        .close => .close,
+        .maximize => .maximize,
+        .restore => .restore,
+        .minimize => .minimize,
+    };
+    renderChromeIcon(kind, rect.x, rect.y, rect.w, rect.h, icon_color);
 }
 
 /// Render placeholder content for tabs that don't have a terminal yet.

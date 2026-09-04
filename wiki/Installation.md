@@ -11,7 +11,10 @@ also published for community testing and remains experimental.
 
 1. Download the latest Windows release from
    [GitHub Releases](https://github.com/xuzhougeng/wispterm/releases).
-2. Unzip it and run **`wispterm.exe`**.
+2. Unzip the whole archive to a folder.
+3. Run **`wispterm.exe`**, or double-click **`Replace-WispTerm.cmd`** to copy
+   this folder over the Start-menu install (or into
+   `%LOCALAPPDATA%\Programs\WispTerm` and create that shortcut).
 
 WispTerm does not elevate shells on its own — a normally launched window gives
 you a standard token. To run an elevated shell, right-click `wispterm.exe` and
@@ -87,6 +90,9 @@ on demand from the [[command center|Getting-Started]]:
 - **Check for Updates** — look for a newer release now.
 - **Download Update** — download the latest release into your Downloads folder.
 - **Open Latest Release** — open the release page in a browser.
+
+On Windows, unzip the download and double-click **`Replace-WispTerm.cmd`** to
+overwrite the Start-menu install.
 
 After upgrading, **What's New** (in the command center, and shown automatically
 the first time you launch a new version) summarizes what changed. **Update

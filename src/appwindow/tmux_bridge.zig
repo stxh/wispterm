@@ -148,6 +148,9 @@ pub const TmuxBridge = struct {
             if (self.panes.find(pane_id)) |p| {
                 if (p.surface) |op| {
                     const s: *Surface = @ptrCast(@alignCast(op));
+                    // A reconnect clears Session's state cache, so this queues
+                    // a fresh seed then; ordinary layout reconciles are no-ops.
+                    self.session.requestPaneSeed(pane_id, false) catch {};
                     return s.ref();
                 }
             }
@@ -186,11 +189,10 @@ pub const TmuxBridge = struct {
                 return null;
             };
             self.panes.setSurface(pane_id, surface);
-            // Seed the pane's primary screen as a fallback: tmux doesn't replay
-            // it via %output on attach. If pane metadata later reports that the
-            // pane is on the alternate screen, onPaneMeta queues an alternate
-            // capture that switches the surface to that screen.
-            self.session.capturePane(pane_id) catch {};
+            // Query after the Surface is registered. The reply seeds the right
+            // tmux grid(s) and restores TUI modes; this also covers panes added
+            // after the initial attach.
+            self.session.requestPaneSeed(pane_id, true) catch {};
             return surface; // ref 1, transferred to the tree
         }
     };
@@ -371,13 +373,9 @@ pub const TmuxBridge = struct {
         }
     }
 
-    fn onPaneMeta(ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8, alternate_on: bool) void {
+    fn onPaneMeta(ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8) void {
         const self: *TmuxBridge = @ptrCast(@alignCast(ctx));
         const p = self.panes.find(pane_id) orelse return;
-        if (alternate_on and !p.alternate_capture_requested) {
-            p.alternate_capture_requested = true;
-            self.session.capturePaneAlternate(pane_id) catch {};
-        }
         const op = p.surface orelse return;
         const s: *Surface = @ptrCast(@alignCast(op));
         if (path.len > 0) s.setCwdPath(path);

@@ -4,13 +4,15 @@ const text_search = @import("../../text_search.zig");
 pub const ProviderId = enum {
     codex,
     claude,
-    reasonix,
+    kimi,
+    opencode,
 
     pub fn label(self: ProviderId) []const u8 {
         return switch (self) {
             .codex => "Codex",
             .claude => "Claude Code",
-            .reasonix => "Reasonix",
+            .kimi => "Kimi",
+            .opencode => "OpenCode",
         };
     }
 };
@@ -19,17 +21,19 @@ pub const CategoryFilter = enum {
     all,
     codex,
     claude,
-    reasonix,
+    kimi,
+    opencode,
     subagent,
 };
 
-pub const CATEGORY_ORDER = [_]CategoryFilter{ .all, .codex, .claude, .reasonix, .subagent };
+pub const CATEGORY_ORDER = [_]CategoryFilter{ .all, .codex, .claude, .kimi, .opencode, .subagent };
 
 pub const CategoryCounts = struct {
     all: usize = 0,
     codex: usize = 0,
     claude: usize = 0,
-    reasonix: usize = 0,
+    kimi: usize = 0,
+    opencode: usize = 0,
     subagent: usize = 0,
 };
 
@@ -45,7 +49,8 @@ pub fn categoryMatchesMeta(category: CategoryFilter, meta: SessionMeta) bool {
         .all => true,
         .codex => meta.provider == .codex and !subagent,
         .claude => meta.provider == .claude and !subagent,
-        .reasonix => meta.provider == .reasonix and !subagent,
+        .kimi => meta.provider == .kimi and !subagent,
+        .opencode => meta.provider == .opencode and !subagent,
         .subagent => subagent,
     };
 }
@@ -55,7 +60,8 @@ pub fn categoryLabel(category: CategoryFilter) []const u8 {
         .all => "All",
         .codex => "Codex",
         .claude => "Claude Code",
-        .reasonix => "Reasonix",
+        .kimi => "Kimi",
+        .opencode => "OpenCode",
         .subagent => "Subagent",
     };
 }
@@ -65,7 +71,8 @@ pub fn categoryCount(counts: CategoryCounts, category: CategoryFilter) usize {
         .all => counts.all,
         .codex => counts.codex,
         .claude => counts.claude,
-        .reasonix => counts.reasonix,
+        .kimi => counts.kimi,
+        .opencode => counts.opencode,
         .subagent => counts.subagent,
     };
 }
@@ -112,7 +119,7 @@ pub fn formatDateKey(key: DateKey, buf: []u8) []const u8 {
 pub const MessageRole = enum { user, assistant, system, tool };
 pub const MessageKind = enum { normal, tool_call, tool_result, meta };
 pub const ScanStatus = enum { ok, partial, not_found, invalid };
-pub const ResumeKind = enum { codex_resume, claude_resume, reasonix_resume, unavailable };
+pub const ResumeKind = enum { codex_resume, claude_resume, kimi_resume, opencode_resume, unavailable };
 
 pub const SessionMeta = struct {
     provider: ProviderId,
@@ -156,7 +163,8 @@ pub fn metadataMatches(meta: SessionMeta, query: []const u8) bool {
 test "ai_history_types: provider labels are stable" {
     try std.testing.expectEqualStrings("Codex", ProviderId.codex.label());
     try std.testing.expectEqualStrings("Claude Code", ProviderId.claude.label());
-    try std.testing.expectEqualStrings("Reasonix", ProviderId.reasonix.label());
+    try std.testing.expectEqualStrings("Kimi", ProviderId.kimi.label());
+    try std.testing.expectEqualStrings("OpenCode", ProviderId.opencode.label());
 }
 
 test "ai_history_types: metadata search covers title summary project session and path" {
@@ -224,12 +232,12 @@ test "ai_history_types: categoryMatchesMeta respects provider" {
         .source_path = "claude.jsonl",
         .resume_kind = .claude_resume,
     };
-    const reasonix: SessionMeta = .{
-        .provider = .reasonix,
-        .session_id = "reasonix",
-        .title = "Reasonix task",
-        .source_path = "reasonix.jsonl",
-        .resume_kind = .reasonix_resume,
+    const kimi: SessionMeta = .{
+        .provider = .kimi,
+        .session_id = "kimi",
+        .title = "Kimi task",
+        .source_path = "kimi.jsonl",
+        .resume_kind = .kimi_resume,
     };
 
     try std.testing.expect(categoryMatchesMeta(.all, codex));
@@ -238,8 +246,8 @@ test "ai_history_types: categoryMatchesMeta respects provider" {
     try std.testing.expect(!categoryMatchesMeta(.codex, claude));
     try std.testing.expect(categoryMatchesMeta(.claude, claude));
     try std.testing.expect(!categoryMatchesMeta(.claude, codex));
-    try std.testing.expect(categoryMatchesMeta(.reasonix, reasonix));
-    try std.testing.expect(!categoryMatchesMeta(.reasonix, codex));
+    try std.testing.expect(categoryMatchesMeta(.kimi, kimi));
+    try std.testing.expect(!categoryMatchesMeta(.kimi, codex));
 }
 
 test "ai_history_types: You are titles are classified as subagent metadata" {
@@ -278,7 +286,7 @@ test "ai_history_types: categoryLabel is stable" {
     try std.testing.expectEqualStrings("All", categoryLabel(.all));
     try std.testing.expectEqualStrings("Codex", categoryLabel(.codex));
     try std.testing.expectEqualStrings("Claude Code", categoryLabel(.claude));
-    try std.testing.expectEqualStrings("Reasonix", categoryLabel(.reasonix));
+    try std.testing.expectEqualStrings("Kimi", categoryLabel(.kimi));
     try std.testing.expectEqualStrings("Subagent", categoryLabel(.subagent));
 }
 

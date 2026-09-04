@@ -19,6 +19,15 @@ const build_options = @import("build_options");
 const std = @import("std");
 const app_metadata = @import("app_metadata.zig");
 
+test "App joinAllWindowThreads pumps the macOS main queue (issue 611)" {
+    const source = @embedFile("App.zig");
+    const join_at = std.mem.indexOf(u8, source, "fn joinAllWindowThreads") orelse return error.MissingJoin;
+    const body = source[join_at..@min(source.len, join_at + 1500)];
+    try std.testing.expect(std.mem.indexOf(u8, body, "live_window_threads") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pumpWhileLive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pumpAppEvents") != null);
+}
+
 test "input ssh download surfaces missing connection and helper probe failures" {
     const input_source = @embedFile("input.zig");
     try std.testing.expect(std.mem.indexOf(u8, input_source, "\"SSH connection unavailable\"") != null);
@@ -70,6 +79,21 @@ test "assistant conversation input routing owns keyboard target lookup" {
 
     const input_source = @embedFile("input.zig");
     try std.testing.expect(std.mem.indexOf(u8, input_source, "assistant_conversation.current(aiCopilotFocused())") != null);
+}
+
+test "copilot permission chip hit-test uses compact geometry" {
+    const renderer = @embedFile("renderer/assistant/conversation.zig");
+    const fn_start = std.mem.indexOf(u8, renderer, "pub fn permissionChipHitTest(") orelse return error.MissingPermissionChipHitTest;
+    const fn_body = renderer[fn_start .. fn_start + 600];
+    try std.testing.expect(std.mem.indexOf(u8, fn_body, "compact: bool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_body, "headerPermissionChipX(x, w, compact)") != null);
+
+    const input_source = @embedFile("input.zig");
+    const copilot = std.mem.indexOf(u8, input_source, "true, // copilot sidebar: chip sits next to the status dot") orelse
+        return error.MissingCopilotCompactChip;
+    const tab = std.mem.indexOf(u8, input_source, "false, // full tab: chip uses the status-text reserve") orelse
+        return error.MissingTabWideChip;
+    try std.testing.expect(copilot < tab);
 }
 
 test "remote file ssh helpers include short keepalive options" {
@@ -248,6 +272,8 @@ test {
     _ = @import("command/palette_model.zig");
     _ = @import("command/center_state.zig");
     _ = @import("command/palette_history_view.zig");
+    _ = @import("recipe/store.zig");
+    _ = @import("recipe/form_state.zig");
     _ = @import("platform/window_state_codec.zig");
     _ = @import("platform/dxgi_core.zig");
     _ = @import("platform/console_host_policy.zig");
@@ -284,6 +310,7 @@ test {
     _ = @import("appwindow/state.zig");
     _ = @import("appwindow/state_guard.zig");
     _ = @import("appwindow/p3_1_guard.zig");
+    _ = @import("appwindow/thread_join.zig");
     _ = @import("ssh/scp.zig");
     _ = @import("surface_registry.zig");
     _ = @import("ctl/protocol.zig");
@@ -305,6 +332,7 @@ test {
     _ = @import("markdown_text.zig");
     _ = @import("assistant/conversation/composer_layout.zig");
     _ = @import("assistant/conversation/input_text.zig");
+    _ = @import("assistant/conversation/prompt_queue.zig");
     _ = @import("assistant/conversation/composer.zig");
     _ = @import("composer_detail_wrap.zig");
     _ = @import("assistant/conversation/presentation.zig");
@@ -326,6 +354,7 @@ test {
     _ = @import("agent_tools/sessions.zig");
     _ = @import("agent_tools/access.zig");
     _ = @import("agent_tools/files.zig");
+    _ = @import("agent_tools/transfer.zig");
     _ = @import("agent_tools/exec.zig");
     _ = @import("agent_tools/dynamic.zig");
     _ = @import("agent_tools/mcp_client.zig");
@@ -343,7 +372,8 @@ test {
     _ = @import("terminal_agents/sessions/types.zig");
     _ = @import("terminal_agents/sessions/provider_codex.zig");
     _ = @import("terminal_agents/sessions/provider_claude.zig");
-    _ = @import("terminal_agents/sessions/provider_reasonix.zig");
+    _ = @import("terminal_agents/sessions/provider_kimi.zig");
+    _ = @import("terminal_agents/sessions/provider_opencode.zig");
     _ = @import("terminal_agents/sessions/source.zig");
     _ = @import("terminal_agents/sessions/cache.zig");
     _ = @import("terminal_agents/sessions/markdown.zig");
@@ -378,6 +408,7 @@ test {
     _ = @import("text_search.zig");
     _ = @import("ssh/prompt.zig");
     _ = @import("selection_unit.zig");
+    _ = @import("send_to_chat.zig");
     _ = @import("scrollbar_model.zig");
     _ = @import("resize_gate.zig");
     _ = @import("preview/token.zig");
@@ -388,6 +419,7 @@ test {
     _ = @import("render_diagnostics.zig");
     _ = @import("diag_log.zig");
     _ = @import("notification.zig");
+    _ = @import("platform/notify_tray_callback.zig");
     _ = @import("clipboard_osc52.zig");
     _ = @import("renderer/gpu/backend.zig");
     // Performance benchmark core (pure modules). cli.zig is excluded here
@@ -402,6 +434,7 @@ test {
     _ = @import("benchmark/scenarios.zig");
     _ = @import("renderer/cell_geometry.zig");
     _ = @import("renderer/titlebar_layout.zig");
+    _ = @import("renderer/chrome_icons.zig");
     _ = @import("assistant/conversation/layout.zig");
     _ = @import("assistant/conversation/types.zig");
     _ = @import("assistant/conversation/identity.zig");
@@ -435,6 +468,7 @@ test {
     _ = @import("feishu/media.zig");
     _ = @import("assistant/conversation/title.zig");
     _ = @import("assistant/conversation/model_switch.zig");
+    _ = @import("assistant/conversation/fork.zig");
     _ = @import("command/registry.zig");
     _ = @import("tools/registry.zig");
     _ = @import("tools/mcp_registry.zig");
@@ -452,6 +486,8 @@ test {
     _ = @import("html/server_model.zig");
     // Platform-aware agent prompt: pure string constants, no heavy deps.
     _ = @import("platform/agent_prompt.zig");
+    // OSC 0/1/2/7 title scanner: must ignore OSC 10/11 color payloads.
+    _ = @import("osc_title.zig");
     // Pure login-shell argv logic (macOS bash/.bashrc fix). OS-agnostic, so it
     // runs here on the native host rather than in the POSIX-only exec path.
     _ = @import("platform/login_shell.zig");

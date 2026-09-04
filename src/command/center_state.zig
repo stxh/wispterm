@@ -8,9 +8,11 @@ pub const CommandAction = enum {
     load_openssh_config,
     new_agent,
     toggle_ai_copilot,
+    send_to_copilot,
     manage_ai_profiles,
     manage_mcp_servers,
     select_agent_history,
+    fork_session,
     split_right,
     split_down,
     split_left,
@@ -52,7 +54,13 @@ pub const CommandAction = enum {
     open_port_forwarding,
     split_preview,
     run_memory_digest_now,
+    show_prompt_queue,
+    clear_prompt_queue,
     star_repo,
+    save_workspace_recipe,
+    open_recipe,
+    import_recipe,
+    export_recipe,
 };
 
 pub const CommandEntry = struct {
@@ -66,9 +74,11 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "New Session", .detail = platform_pty_command.session_launcher_detail, .shortcut = "", .action = .new_tab },
     .{ .title = "New Copilot", .detail = "Open a new Copilot tab with the default AI config", .shortcut = "", .action = .new_agent },
     .{ .title = "Toggle Copilot", .detail = "Open or close the Copilot sidebar on the current terminal", .shortcut = "", .action = .toggle_ai_copilot },
+    .{ .title = "Send to Chat", .detail = "Send the terminal selection (or recent output) to Copilot as a context card", .shortcut = "", .action = .send_to_copilot },
     .{ .title = "Manage AI Profiles", .detail = "Create, edit, or delete saved AI profiles", .shortcut = "", .action = .manage_ai_profiles },
     .{ .title = "MCP Servers", .detail = "Add, edit, test, or remove MCP tool servers", .shortcut = "", .action = .manage_mcp_servers },
     .{ .title = "Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
+    .{ .title = "Fork Session", .detail = "Copy the current Copilot conversation into a new independent session", .shortcut = "", .action = .fork_session },
     .{ .title = "Skill Center", .detail = "Manage Claude Code / Codex skills and local executable tools", .shortcut = "", .action = .open_skill_center },
     .{ .title = "Split Right", .detail = "Create a panel to the right", .shortcut = "", .action = .split_right },
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
@@ -111,7 +121,13 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "Port Forwarding", .detail = "Manage SSH port forwarding rules", .shortcut = "", .action = .open_port_forwarding },
     .{ .title = "Split Preview", .detail = "Open a preview panel on the right", .shortcut = "", .action = .split_preview },
     .{ .title = "Run Memory Digest Now", .detail = "Scan AI chat logs and generate today's digest", .shortcut = "", .action = .run_memory_digest_now },
+    .{ .title = "Show Prompt Queue", .detail = "View, reorder, edit, or drop prompts queued while the AI is busy", .shortcut = "", .action = .show_prompt_queue },
+    .{ .title = "Clear Prompt Queue", .detail = "Drop every prompt queued while the AI is busy", .shortcut = "", .action = .clear_prompt_queue },
     .{ .title = "Star Me", .detail = "Open the WispTerm GitHub repo to give it a star", .shortcut = "", .action = .star_repo },
+    .{ .title = "Save Workspace Recipe", .detail = "Save this window's layout as a named recipe", .shortcut = "", .action = .save_workspace_recipe },
+    .{ .title = "Open Recipe", .detail = "Restore a saved recipe into a new window (search its name here)", .shortcut = "", .action = .open_recipe },
+    .{ .title = "Import Recipe", .detail = "Import a shared recipe JSON file into your recipes", .shortcut = "", .action = .import_recipe },
+    .{ .title = "Export Recipe", .detail = "Save this window's layout as a shareable recipe JSON file", .shortcut = "", .action = .export_recipe },
 };
 
 test "command center exposes generic integration prompt action only" {
@@ -342,6 +358,10 @@ test "command center exposes Toggle Copilot" {
     try expectCommandEntry("Toggle Copilot", .toggle_ai_copilot);
 }
 
+test "command center includes Send to Chat action" {
+    try expectCommandEntry("Send to Chat", .send_to_copilot);
+}
+
 test "command center includes Manage AI Profiles action" {
     try expectCommandEntry("Manage AI Profiles", .manage_ai_profiles);
 }
@@ -352,6 +372,10 @@ test "command center includes MCP Servers action" {
 
 test "command center includes Copilot History action" {
     try expectCommandEntry("Copilot History", .select_agent_history);
+}
+
+test "command center includes Fork Session action" {
+    try expectCommandEntry("Fork Session", .fork_session);
 }
 
 test "command catalog no longer has a Load Copilot Conversation entry" {
@@ -432,6 +456,11 @@ test "command center includes Feishu direct actions" {
 
 test "command center includes quick configure AI" {
     try expectCommandEntry("Settings: Quick Configure AI", .quick_configure_ai);
+}
+
+test "command center includes prompt queue actions" {
+    try expectCommandEntry("Show Prompt Queue", .show_prompt_queue);
+    try expectCommandEntry("Clear Prompt Queue", .clear_prompt_queue);
 }
 
 test "command center browser text is backend neutral" {

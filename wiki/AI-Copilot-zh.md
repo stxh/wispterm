@@ -252,10 +252,11 @@ AI Chat 标签页和 Copilot 侧栏对话。这个选择器会按本地日期分
 删除选中的已保存对话，`Esc` 返回普通命令中心。
 
 打开会话启动器（`Ctrl+Shift+T`）选择 **Sessions**，在本地、WSL 或 SSH 目标上浏览
-Codex、Claude Code、Reasonix 的对话记录。WispTerm 连接目标，扫描 `$HOME/.codex`、
-`$HOME/.claude`、`$HOME/.reasonix` 的元数据，仅在你打开某行时才加载该对话。**Resume**
-会在同一目标上、按历史文件记录的原始项目目录打开一个真实终端标签；若该目录已不存在，
-恢复会停止，而不是回退到 `$HOME`。
+Codex、Claude Code、Kimi Code 的对话记录。WispTerm 连接目标，扫描 `$HOME/.codex`、
+`$HOME/.claude` 和 `$HOME/.kimi-code/sessions` 的元数据，仅在你打开某行时才加载该对话。
+Kimi Code 还会读取会话的 `state.json` 与全局 `$HOME/.kimi-code/session_index.jsonl`。
+**Resume** 会在同一目标上、按历史文件记录的原始项目目录打开一个真实终端标签；若该目录
+已不存在，恢复会停止，而不是回退到 `$HOME`。
 
 ## 斜杠命令
 

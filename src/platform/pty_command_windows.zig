@@ -616,7 +616,7 @@ pub const Command = struct {
         self.attr_list_size = attr_size;
     }
 
-    pub fn wait(self: *const Command, block: bool) !?Exit {
+    pub fn wait(self: *Command, block: bool) !?Exit {
         if (self.process == INVALID_HANDLE_VALUE) return null;
 
         const timeout: DWORD = if (block) infinite else 0;
@@ -629,6 +629,18 @@ pub const Command = struct {
         if (GetExitCodeProcess(self.process, &exit_code) == 0) return error.GetExitCodeFailed;
 
         return Exit{ .exited = exit_code };
+    }
+
+    pub fn waitUntilReaped(self: *Command, timeout_ms: u64) ?Exit {
+        if (self.process == INVALID_HANDLE_VALUE) return null;
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            const result = self.wait(false) catch return null;
+            if (result) |exit| return exit;
+            if (self.process == INVALID_HANDLE_VALUE) return null;
+            if (std.time.milliTimestamp() - start_ms >= @as(i64, @intCast(timeout_ms))) return null;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
     }
 
     pub fn deinit(self: *Command) void {

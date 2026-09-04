@@ -13,9 +13,17 @@ class Ctl:
         self.home = home
         self.binary = binary
 
-    def _run(self, args, timeout: float = 10.0) -> str:
+    def _env(self) -> dict:
         env = dict(os.environ)
         env["HOME"] = self.home
+        # Match LinuxDriver isolation: wisptermctl reads the same XDG config dir
+        # the app writes (src/platform/dirs.zig configDirFromXdgOrHome). Harmless
+        # on macOS, where dirs.zig uses ~/Library/Application Support.
+        env["XDG_CONFIG_HOME"] = os.path.join(self.home, ".config")
+        return env
+
+    def _run(self, args, timeout: float = 10.0) -> str:
+        env = self._env()
         proc = subprocess.run(
             [self.binary, *args],
             capture_output=True, text=True, env=env, timeout=timeout,
@@ -43,6 +51,15 @@ class Ctl:
         # bypassing the OS input path (see issue #279). `data` may contain a
         # literal newline to submit a command.
         self._run(["send-text", "-t", pane, data])
+
+    def spawn(self, *command: str, cwd: str = None) -> None:
+        """Open a new tab. Empty command → the configured default shell."""
+        args = ["spawn"]
+        if cwd:
+            args += ["--cwd", cwd]
+        if command:
+            args += ["--", *command]
+        self._run(args)
 
     def wait_for(self, pane: str, pattern: str, timeout: float = 5.0,
                  interval: float = 0.2, clock=wait._RealClock) -> None:

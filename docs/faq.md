@@ -187,8 +187,11 @@ command center:
 - **Open Latest Release** — open the latest WispTerm GitHub Release page in a
   browser.
 
-After upgrading, run **What's New** from the command center (it also pops up
-automatically the first time you launch a new version) to see what changed.
+Unzip the downloaded zip and double-click **`Replace-WispTerm.cmd`** to replace
+the Start-menu install (or install into `%LOCALAPPDATA%\Programs\WispTerm` if
+no shortcut exists yet). After upgrading, run **What's New** from the command
+center (it also pops up automatically the first time you launch a new version)
+to see what changed.
 
 ## Is There a Linux Build?
 

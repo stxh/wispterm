@@ -27,6 +27,10 @@ pub fn titlebarIconGlyph(icon: anytype) u32 {
         .maximize => 0x25A1,
         .minimize => '-',
         .restore => 0x25A3,
+        .menu => '=',
+        .settings => '*',
+        .help => '?',
+        .copilot => '@',
     };
 }
 

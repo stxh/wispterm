@@ -290,7 +290,9 @@ cli_cwd: ?[]u8 = null,
 /// Enable agent tools for AI Chat profiles by default.
 @"ai-agent-enabled": bool = false,
 
-/// Show native desktop notifications for OSC 9 / OSC 777 sequences (macOS).
+/// Show native desktop notifications for OSC 9 / OSC 777 sequences.
+/// Uses the platform toast facility (macOS notification center, Windows tray
+/// balloon, Linux notify-send).
 /// When false, such sequences are ignored entirely (no toast, no bell badge).
 /// Does not affect the plain terminal bell.
 @"desktop-notifications": bool = true,

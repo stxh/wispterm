@@ -34,6 +34,7 @@ pub const Command = union(enum) {
     copy,
     paste,
     paste_image,
+    send_to_copilot,
     focus_split: FocusTarget,
     equalize_splits,
     next_tab,
@@ -69,6 +70,7 @@ pub fn resolve(action: keybind.Action, phase: Phase) ?Command {
             .copy => .copy,
             .paste => .paste,
             .paste_image => .paste_image,
+            .send_to_copilot => .send_to_copilot,
             .focus_left => .{ .focus_split = .left },
             .focus_right => .{ .focus_split = .right },
             .focus_up => .{ .focus_split = .up },
@@ -186,6 +188,20 @@ test "copilot_conversation_picker resolves to the picker command in the early ph
     );
     // It is an early-phase command, matching the real key-routing order.
     try std.testing.expectEqual(@as(?Command, null), resolve(.copilot_conversation_picker, .late));
+}
+
+test "send_to_copilot resolves in the late phase and is parseable but unbound by default" {
+    try std.testing.expectEqual(Command.send_to_copilot, resolve(.send_to_copilot, .late).?);
+    try std.testing.expectEqual(@as(?Command, null), resolve(.send_to_copilot, .early));
+    try std.testing.expectEqual(
+        keybind.Action.send_to_copilot,
+        keybind.Action.parse("send_to_copilot").?,
+    );
+    // No default binding: the action is palette/config only until the user
+    // binds it explicitly.
+    for (keybind.default_bindings) |binding| {
+        try std.testing.expect(binding.action != .send_to_copilot);
+    }
 }
 
 // Behavior test (converted from a source-string grep that asserted keybind.zig

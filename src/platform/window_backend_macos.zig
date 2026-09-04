@@ -450,6 +450,20 @@ test "macOS backend normalizes control-modified shortcut key codes" {
     try std.testing.expectEqual(@as(usize, 0xBF), wispterm_macos_window_test_map_key_code(44, "/"));
 }
 
+test "macOS backend maps keypad Enter to normal Enter" {
+    // AppKit reports the keypad key as native key code 0x4C and character
+    // NSEnterCharacter (U+0003), not the carriage return produced by Return.
+    const keypad_enter = [_:0]u8{0x03};
+    try std.testing.expectEqual(
+        @as(usize, platform_input.key_enter),
+        wispterm_macos_window_test_map_key_code(0x4C, &keypad_enter),
+    );
+    try std.testing.expectEqual(
+        @as(usize, platform_input.key_enter),
+        wispterm_macos_window_test_map_key_code(0x4C, null),
+    );
+}
+
 test "macOS backend drains text, mouse, wheel, and IME preedit events" {
     const title = std.unicode.utf8ToUtf16LeStringLiteral("WispTerm Input Smoke");
     var window = try Window.init(320, 180, title, null, null, false);

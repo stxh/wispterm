@@ -118,7 +118,7 @@ pub const Command = struct {
     /// child" (not yet spawned, or already reaped).
     pid: std.c.pid_t = -1,
 
-    pub fn wait(self: *const Command, block: bool) !?Exit {
+    pub fn wait(self: *Command, block: bool) !?Exit {
         if (self.pid <= 0) return null;
         // POSIX-only: guarded so this file still compiles under a Windows
         // target build (it is selected only for non-windows hosts).
@@ -127,9 +127,33 @@ pub const Command = struct {
         const options: u32 = if (block) 0 else process_shared.WNOHANG;
         switch (process_shared.reapChild(self.pid, options)) {
             .still_running => return null,
-            .no_child => return null,
-            .reaped => |code| return Exit{ .exited = code },
-            .reaped_unknown => return .unknown,
+            .no_child => {
+                self.pid = -1;
+                return null;
+            },
+            .reaped => |code| {
+                self.pid = -1;
+                return Exit{ .exited = code };
+            },
+            .reaped_unknown => {
+                self.pid = -1;
+                return .unknown;
+            },
+        }
+    }
+
+    /// Retry a non-blocking wait until the child is reaped or `timeout_ms`
+    /// elapses. Used after PTY EOF/EIO so a single WNOHANG race cannot leave
+    /// a defunct child under the emulator.
+    pub fn waitUntilReaped(self: *Command, timeout_ms: u64) ?Exit {
+        if (self.pid <= 0) return null;
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            const result = self.wait(false) catch return null;
+            if (result) |exit| return exit;
+            if (self.pid <= 0) return null;
+            if (std.time.milliTimestamp() - start_ms >= @as(i64, @intCast(timeout_ms))) return null;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
         }
     }
 
@@ -387,6 +411,47 @@ test "unsupported backend uses UTF-8 native command and cwd storage" {
     defer freeCwd(std.testing.allocator, cwd);
     var utf8: [32]u8 = undefined;
     try std.testing.expectEqualStrings("/tmp", cwdToUtf8(&utf8, cwdFromOwned(cwd)).?);
+}
+
+test "Command.wait reaps an exited child so it does not stay defunct" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // `/bin/sh -c` matches the other POSIX spawn tests in this file. A bare
+    // `/bin/true` exited 1 on macOS ARM CI, which is not the reap invariant.
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", "exit 42" }, std.testing.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    var cmd = Command{ .pid = child.id };
+    defer cmd.deinit();
+    const exit = cmd.waitUntilReaped(500) orelse return error.NotReaped;
+    try std.testing.expectEqual(Command.Exit{ .exited = 42 }, exit);
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), cmd.pid);
+    try std.testing.expectEqual(process_shared.WaitResult.no_child, process_shared.reapChild(child.id, 0));
+}
+
+test "waitUntilReaped catches a child that exits after the first WNOHANG" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", "sleep 0.05" }, std.testing.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    var cmd = Command{ .pid = child.id };
+    defer cmd.deinit();
+    const first = try cmd.wait(false);
+    if (first) |exit| {
+        try std.testing.expectEqual(Command.Exit{ .exited = 0 }, exit);
+    } else {
+        const exit = cmd.waitUntilReaped(500) orelse return error.NotReaped;
+        try std.testing.expectEqual(Command.Exit{ .exited = 0 }, exit);
+    }
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), cmd.pid);
+    try std.testing.expectEqual(process_shared.WaitResult.no_child, process_shared.reapChild(child.id, 0));
 }
 
 test "Command.kill sends SIGHUP and the child is reaped as signaled" {

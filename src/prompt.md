@@ -24,6 +24,8 @@ Prefer the dedicated file tools over shell `cat`/`sed`/here-docs for reading and
 - `write_file` to create or fully overwrite a file.
 - `edit_file` to replace an exact, unique string (set `replace_all` for every occurrence).
 
+Never use shell heredocs (`<<EOF`, `<<'PY'`, etc.) to create files or feed multiline scripts in local, WSL, or SSH commands. Use `write_file` for the complete content, then run the file separately. This applies even to large or temporary scripts that will be deleted afterward.
+
 For WSL/SSH files, pass `surface_id` of the open terminal (from `terminal_list`) or use the selected terminal context; relative paths resolve against that surface cwd. Omit `surface_id` only when no terminal context is selected and you want local files. Writes and edits show a diff and may ask for approval.
 
 Python:

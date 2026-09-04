@@ -18,8 +18,16 @@ pub fn start(self: *Command, pty: *Pty, command: platform_command.CommandLine, c
     return pty.startCommand(&self.impl, command, cwd);
 }
 
-pub fn wait(self: *const Command, block: bool) !?Exit {
+pub fn wait(self: *Command, block: bool) !?Exit {
     return self.impl.wait(block);
+}
+
+/// After PTY EOF/EIO the child is usually already a zombie, but a single
+/// WNOHANG can lose that race and leave a defunct pid under the emulator.
+/// Retry until reaped or `timeout_ms` elapses. Does not block forever so a
+/// process that closed the slave and kept running cannot hang the reader.
+pub fn waitUntilReaped(self: *Command, timeout_ms: u64) ?Exit {
+    return self.impl.waitUntilReaped(timeout_ms);
 }
 
 pub fn deinit(self: *Command) void {
@@ -54,7 +62,11 @@ test "Command delegates lifecycle API to platform implementation" {
 
     const wait_info = @typeInfo(@TypeOf(wait)).@"fn";
     try std.testing.expectEqual(@as(usize, 2), wait_info.params.len);
-    try std.testing.expect(wait_info.params[0].type.? == *const Command);
+    try std.testing.expect(wait_info.params[0].type.? == *Command);
+
+    const reap_info = @typeInfo(@TypeOf(waitUntilReaped)).@"fn";
+    try std.testing.expectEqual(@as(usize, 2), reap_info.params.len);
+    try std.testing.expect(reap_info.params[0].type.? == *Command);
 
     const deinit_info = @typeInfo(@TypeOf(deinit)).@"fn";
     try std.testing.expectEqual(@as(usize, 1), deinit_info.params.len);

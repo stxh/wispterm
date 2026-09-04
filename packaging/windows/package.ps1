@@ -154,6 +154,13 @@ function Copy-PortablePayload {
         Copy-Item -Path $ConPtyPair.Dll -Destination (Join-Path $TargetDir 'conpty.dll') -Force
         Copy-Item -Path $ConPtyPair.HostExe -Destination (Join-Path $TargetDir 'OpenConsole.exe') -Force
     }
+
+    $replaceCmd = Join-Path $PSScriptRoot 'Replace-WispTerm.cmd'
+    $replacePs1 = Join-Path $PSScriptRoot 'replace-install.ps1'
+    if (-not (Test-Path $replaceCmd)) { throw "Replace script was not found: $replaceCmd" }
+    if (-not (Test-Path $replacePs1)) { throw "Replace script was not found: $replacePs1" }
+    Copy-Item -Path $replaceCmd -Destination (Join-Path $TargetDir 'Replace-WispTerm.cmd') -Force
+    Copy-Item -Path $replacePs1 -Destination (Join-Path $TargetDir 'replace-install.ps1') -Force
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))

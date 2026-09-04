@@ -90,6 +90,7 @@ pub const ProgressSnapshot = struct {
 
 var g_settings_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 var g_settings: Settings = .{};
+var g_state_mutex: std.Thread.Mutex = .{};
 var g_thread: ?std.Thread = null;
 var g_in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var g_last_tick_check_ms: i64 = 0;
@@ -100,8 +101,11 @@ var g_progress: ProgressSnapshot = .{};
 var g_progress_ctx: u8 = 0;
 
 /// Loads a copy of `s`, duping the borrowed strings into the module's own
-/// arena. Call on the main thread whenever config is loaded/hot-reloaded.
+/// arena. Config reloads may arrive from any window thread.
 pub fn updateSettings(s: Settings) void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+
     g_settings_arena.deinit();
     g_settings_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const alloc = g_settings_arena.allocator();
@@ -124,6 +128,9 @@ pub fn updateSettings(s: Settings) void {
 /// Main-loop tick. Self-throttles: only actually checks once per
 /// TICK_INTERVAL_MS. Cheap to call every frame.
 pub fn tick(gpa: std.mem.Allocator) void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+
     const now_ms = std.time.milliTimestamp();
     if (g_app_started_ms == null) g_app_started_ms = now_ms;
 
@@ -159,6 +166,9 @@ pub fn tick(gpa: std.mem.Allocator) void {
 /// explicit user request, not a scheduled decision). Still respects the
 /// in_flight guard: if a run is already in progress, this is a no-op.
 pub fn runNow(gpa: std.mem.Allocator) void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+
     if (g_in_flight.load(.acquire)) {
         std.log.info("memory_digest: runNow skipped, a run is already in progress", .{});
         setProgress(.skipped, true, .{ .detail = "Memory digest already running" });
@@ -216,6 +226,9 @@ fn spawnRun(gpa: std.mem.Allocator, now_ms: i64, tz_offset_seconds: i32, manual:
 /// case is losing the in-progress run's record, not a corrupt one. Proper
 /// LLM-call timeouts are M5.
 pub fn deinit() void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+
     g_shutting_down.store(true, .release);
     if (g_thread) |t| {
         if (g_in_flight.load(.acquire)) {
@@ -226,6 +239,12 @@ pub fn deinit() void {
         g_thread = null;
     }
     g_settings_arena.deinit();
+    // ArenaAllocator.deinit does not clear its linked-list head. Leave a fresh
+    // empty value behind so a repeated process teardown cannot walk freed nodes.
+    g_settings_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    g_settings = .{};
+    g_last_tick_check_ms = 0;
+    g_app_started_ms = null;
 }
 
 /// "HH:MM" (H:0-23, M:0-59, 1-2 digit fields) -> minutes since local midnight.
@@ -510,6 +529,30 @@ fn markRanToday(gpa: std.mem.Allocator, now_ms: i64, tz_offset_seconds: i32) voi
 // otherwise identical and already covered by reading the source directly.
 // If this needs real coverage later, test it via test-full's macOS-only
 // app test binary instead of the fast suite.
+
+test "memory_digest_scheduler: settings reload and shutdown can repeat safely" {
+    defer g_shutting_down.store(false, .release);
+
+    updateSettings(.{
+        .enabled = true,
+        .profile_name = "first",
+        .run_after = "01:23",
+    });
+    try std.testing.expectEqualStrings("first", g_settings.profile_name);
+    try std.testing.expectEqualStrings("01:23", g_settings.run_after);
+
+    updateSettings(.{
+        .profile_name = "second",
+        .run_after = "04:56",
+    });
+    try std.testing.expectEqualStrings("second", g_settings.profile_name);
+    try std.testing.expectEqualStrings("04:56", g_settings.run_after);
+
+    deinit();
+    deinit();
+    try std.testing.expectEqualStrings("", g_settings.profile_name);
+    try std.testing.expectEqualStrings("04:00", g_settings.run_after);
+}
 
 test "memory_digest_scheduler: parseRunAfterMinutes accepts HH:MM" {
     try std.testing.expectEqual(@as(?u16, 240), parseRunAfterMinutes("04:00"));

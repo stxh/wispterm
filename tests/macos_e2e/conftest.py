@@ -1,21 +1,31 @@
+import os
+import shutil
+import sys
+
 import pytest
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "e2e: end-to-end test requiring a real WispTerm.app GUI instance")
+    config.addinivalue_line("markers", "e2e: end-to-end test requiring a real WispTerm GUI instance")
     config.addinivalue_line("markers", "macos_only: test that only applies to the macOS backend")
+    config.addinivalue_line("markers", "linux_only: test that only applies to the Linux backend")
 
-
-# macos_only 标记的便捷别名,供用例 @macos_only 使用
-import sys
 
 macos_only = pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only behavior")
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="Linux-only behavior")
 
-import os
+# These modules import MacDriver → Quartz at collection time. Skip the files on
+# non-macOS rather than erroring out of the Linux run.
+collect_ignore = []
+if sys.platform != "darwin":
+    collect_ignore.extend(["test_copilot_history.py", "test_mcp_panel.py"])
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# macOS uses .app bundle; Linux uses plain binary. Env overrides let CI/dev
+# point at a prebuilt pair without rebuilding via `make test-linux-e2e`.
 APP_BUNDLE = os.path.join(REPO_ROOT, "zig-out", "bin", "WispTerm.app")
-CTL_BINARY = os.path.join(REPO_ROOT, "zig-out", "bin", "wisptermctl")
+LINUX_BINARY = os.environ.get("WISPTERM_E2E_BINARY") or os.path.join(REPO_ROOT, "zig-out", "bin", "wispterm")
+CTL_BINARY = os.environ.get("WISPTERM_E2E_CTL") or os.path.join(REPO_ROOT, "zig-out", "bin", "wisptermctl")
 
 
 def _pyobjc_available() -> bool:
@@ -50,6 +60,11 @@ def _screen_locked() -> bool:
         return False
 
 
+def _linux_display_available() -> bool:
+    """Check if DISPLAY is set and Xorg/Wayland is available."""
+    return "DISPLAY" in os.environ
+
+
 def require_macos_gui():
     """Skip the calling test unless this host can drive a real WispTerm.app via
     synthetic input: macOS + importable PyObjC + a built app/ctl bundle + granted
@@ -77,15 +92,51 @@ def require_macos_gui():
         pytest.skip("screen is locked: synthetic CGEvents are dropped while locked; unlock and retry")
 
 
+def require_linux_gui():
+    """Skip the calling test unless this host can drive a real Linux WispTerm via
+    synthetic input: Linux + DISPLAY set + a built binary/ctl. xdotool is optional:
+    control-channel-only tests work without it; real-input tests skip when absent."""
+    if sys.platform != "linux":
+        pytest.skip("Linux-only E2E harness")
+    if not _linux_display_available():
+        pytest.skip("DISPLAY not set; Linux GUI tests require an X11/Wayland session")
+    if not os.path.exists(LINUX_BINARY):
+        pytest.skip(f"missing {LINUX_BINARY}; run `make test-linux-e2e` (builds it first)")
+    if not os.path.exists(CTL_BINARY):
+        pytest.skip(f"missing {CTL_BINARY}; run `make test-linux-e2e` (builds it first)")
+
+
+def require_xdotool():
+    """Skip unless xdotool can inject real key/mouse events."""
+    if not shutil.which("xdotool"):
+        pytest.skip("xdotool not installed; real-input Linux E2E skipped")
+
+
+def require_xclip():
+    """Skip unless xclip can read/write the clipboard."""
+    if not shutil.which("xclip"):
+        pytest.skip("xclip not installed; clipboard Linux E2E skipped")
+
+
 @pytest.fixture(scope="session")
 def app():
-    require_macos_gui()
-
-    from tests.macos_e2e.driver.macos import MacDriver
-    driver = MacDriver(app_bundle=APP_BUNDLE, ctl_binary=CTL_BINARY)
-    driver.launch()
-    yield driver
-    driver.quit()
+    """Cross-platform app driver fixture: macOS or Linux depending on the host."""
+    if sys.platform == "darwin":
+        require_macos_gui()
+        from tests.macos_e2e.driver.macos import MacDriver
+        driver = MacDriver(app_bundle=APP_BUNDLE, ctl_binary=CTL_BINARY)
+        driver.launch()
+        yield driver
+        driver.quit()
+    elif sys.platform == "linux":
+        require_linux_gui()
+        from tests.macos_e2e.driver.linux import LinuxDriver
+        driver = LinuxDriver(binary=LINUX_BINARY, ctl_binary=CTL_BINARY)
+        driver.launch()
+        yield driver
+        driver.quit()
+    else:
+        pytest.skip(f"E2E harness not implemented for {sys.platform}")
 
 
 @pytest.fixture()

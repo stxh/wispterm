@@ -168,7 +168,7 @@ carry historical boundary debt, which is why they carry the ratchets.
   `agent/` owns WispTerm's own agent permissions, config, memory, file editing,
   and conversation history; `agent_tools/` owns model tool-call runtime wrappers;
   and `terminal_agents/` owns adapters for external terminal agent applications
-  such as Claude Code, Codex, Reasonix, and Subagent. In particular,
+  such as Claude Code, Codex, Kimi Code, and Subagent. In particular,
   `terminal_agents/sessions/` owns discovery, transcript preview, and resume
   commands for those external terminal agents. Other feature domains include
   `weixin/*`, `skill/`, `file_explorer.zig`, `tmux/*`, and the remote

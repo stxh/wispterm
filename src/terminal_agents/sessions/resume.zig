@@ -13,7 +13,8 @@ pub fn resumeCommand(meta: types.SessionMeta, out: []u8) ResumeError![]const u8 
     const parts: ResumeCommandParts = switch (meta.resume_kind) {
         .codex_resume => .{ .prefix = "codex resume ", .suffix = "" },
         .claude_resume => .{ .prefix = "claude --resume ", .suffix = "" },
-        .reasonix_resume => .{ .prefix = "reasonix chat --session ", .suffix = " --resume" },
+        .kimi_resume => .{ .prefix = "kimi --session ", .suffix = "" },
+        .opencode_resume => .{ .prefix = "opencode -s ", .suffix = "" },
         .unavailable => return error.UnsupportedProvider,
     };
 
@@ -84,11 +85,11 @@ pub fn checkedPowerShellResume(meta: types.SessionMeta, out: []u8) ResumeError![
     switch (meta.resume_kind) {
         .codex_resume => try append(out, &pos, "codex resume "),
         .claude_resume => try append(out, &pos, "claude --resume "),
-        .reasonix_resume => try append(out, &pos, "reasonix chat --session "),
+        .kimi_resume => try append(out, &pos, "kimi --session "),
+        .opencode_resume => try append(out, &pos, "opencode -s "),
         .unavailable => return error.UnsupportedProvider,
     }
     try appendPowerShellSingleQuote(out, &pos, meta.session_id);
-    if (meta.resume_kind == .reasonix_resume) try append(out, &pos, " --resume");
     try append(out, &pos, " } else { Write-Error ");
     try appendPowerShellProjectNotFound(out, &pos, meta.project_dir);
     try append(out, &pos, " }");
@@ -208,15 +209,25 @@ test "ai_history_resume: builds provider resume commands" {
     };
     try std.testing.expectEqualStrings("claude --resume xyz", try resumeCommand(claude, &out));
 
-    const reasonix: types.SessionMeta = .{
-        .provider = .reasonix,
+    const kimi: types.SessionMeta = .{
+        .provider = .kimi,
         .session_id = "code-project",
         .title = "C",
         .project_dir = "/home/me/project",
         .source_path = "c.jsonl",
-        .resume_kind = .reasonix_resume,
+        .resume_kind = .kimi_resume,
     };
-    try std.testing.expectEqualStrings("reasonix chat --session code-project --resume", try resumeCommand(reasonix, &out));
+    try std.testing.expectEqualStrings("kimi --session code-project", try resumeCommand(kimi, &out));
+
+    const opencode: types.SessionMeta = .{
+        .provider = .opencode,
+        .session_id = "ses_03282e836ffeRuTJVdTjunUnUs",
+        .title = "D",
+        .project_dir = "/home/me/project",
+        .source_path = "ses_03282e836ffeRuTJVdTjunUnUs",
+        .resume_kind = .opencode_resume,
+    };
+    try std.testing.expectEqualStrings("opencode -s ses_03282e836ffeRuTJVdTjunUnUs", try resumeCommand(opencode, &out));
 }
 
 test "ai_history_resume: quotes unsafe session ids" {
@@ -241,15 +252,15 @@ test "ai_history_resume: quotes unsafe session ids" {
     };
     try std.testing.expectEqualStrings("claude --resume 'it'\\''s-here'", try resumeCommand(with_quote, &out));
 
-    const reasonix_with_quote: types.SessionMeta = .{
-        .provider = .reasonix,
+    const kimi_with_quote: types.SessionMeta = .{
+        .provider = .kimi,
         .session_id = "it'has space",
         .title = "R",
         .project_dir = "/home/me/project",
         .source_path = "r.jsonl",
-        .resume_kind = .reasonix_resume,
+        .resume_kind = .kimi_resume,
     };
-    try std.testing.expectEqualStrings("reasonix chat --session 'it'\\''has space' --resume", try resumeCommand(reasonix_with_quote, &out));
+    try std.testing.expectEqualStrings("kimi --session 'it'\\''has space'", try resumeCommand(kimi_with_quote, &out));
 
     const with_metacharacters: types.SessionMeta = .{
         .provider = .codex,
@@ -388,17 +399,30 @@ test "ai_history_resume: checked PowerShell resume checks directory before resum
         try checkedPowerShellResume(meta, &out),
     );
 
-    const reasonix: types.SessionMeta = .{
-        .provider = .reasonix,
+    const kimi: types.SessionMeta = .{
+        .provider = .kimi,
         .session_id = "code-project",
         .title = "R",
         .project_dir = "C:\\Project",
         .source_path = "r.jsonl",
-        .resume_kind = .reasonix_resume,
+        .resume_kind = .kimi_resume,
     };
     try std.testing.expectEqualStrings(
-        "if (Test-Path -LiteralPath 'C:\\Project' -PathType Container) { Set-Location -LiteralPath 'C:\\Project'; reasonix chat --session 'code-project' --resume } else { Write-Error 'Cannot resume: project folder not found: C:\\Project' }",
-        try checkedPowerShellResume(reasonix, &out),
+        "if (Test-Path -LiteralPath 'C:\\Project' -PathType Container) { Set-Location -LiteralPath 'C:\\Project'; kimi --session 'code-project' } else { Write-Error 'Cannot resume: project folder not found: C:\\Project' }",
+        try checkedPowerShellResume(kimi, &out),
+    );
+
+    const opencode: types.SessionMeta = .{
+        .provider = .opencode,
+        .session_id = "ses_abc",
+        .title = "O",
+        .project_dir = "C:\\Project",
+        .source_path = "ses_abc",
+        .resume_kind = .opencode_resume,
+    };
+    try std.testing.expectEqualStrings(
+        "if (Test-Path -LiteralPath 'C:\\Project' -PathType Container) { Set-Location -LiteralPath 'C:\\Project'; opencode -s 'ses_abc' } else { Write-Error 'Cannot resume: project folder not found: C:\\Project' }",
+        try checkedPowerShellResume(opencode, &out),
     );
 }
 

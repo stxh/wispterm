@@ -85,6 +85,7 @@ const copyAiChatMessageToClipboard = clipboard.copyAiChatMessageToClipboard;
 const copyAiChatSpanToClipboard = clipboard.copyAiChatSpanToClipboard;
 pub const handleFileDrop = clipboard.handleFileDrop;
 pub const copySelectionToClipboard = clipboard.copySelectionToClipboard;
+pub const allocActiveSelectionText = clipboard.allocActiveSelectionText;
 pub const pasteFromClipboard = clipboard.pasteFromClipboard;
 const pasteClipboardIntoBrowserUrlBar = clipboard.pasteClipboardIntoBrowserUrlBar;
 const pasteClipboardIntoSessionLauncher = clipboard.pasteClipboardIntoSessionLauncher;
@@ -3124,6 +3125,7 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         .open_settings => overlays.settingsPageOpen(),
         // Late
         .copy => copySelectionToClipboard(),
+        .send_to_copilot => _ = AppWindow.sendSelectionToCopilot(),
         .paste => {
             if (assistant_conversation.current(aiCopilotFocused())) |target| {
                 pasteFromClipboardIntoAiChat(target.session);
@@ -6011,6 +6013,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             @floatCast(titlebarHeight()),
                             chat_x,
                             chat_w,
+                            true, // copilot sidebar: compact header layout
                         )) {
                             overlays.openSwitchModelPicker(chat);
                             requestInputRepaint();
@@ -6023,6 +6026,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             @floatCast(titlebarHeight()),
                             chat_x,
                             chat_w,
+                            true, // copilot sidebar: chip sits next to the status dot
                         )) {
                             toggleAiAgentPermission();
                             return;
@@ -6149,6 +6153,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
                     @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
+                    false, // full tab
                 )) {
                     overlays.openSwitchModelPicker(chat);
                     requestInputRepaint();
@@ -6161,6 +6166,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
                     @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
+                    false, // full tab: chip uses the status-text reserve
                 )) {
                     toggleAiAgentPermission();
                     return;

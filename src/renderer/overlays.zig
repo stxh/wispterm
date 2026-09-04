@@ -52,6 +52,9 @@ const mcp_probe = @import("../assistant/mcp_probe.zig");
 const assistant_profiles = @import("overlays/assistant_profiles.zig");
 const feishu_config = @import("overlays/feishu_config.zig");
 const quick_ai_config = @import("overlays/quick_ai_config.zig");
+const recipe_form_state = @import("../recipe/form_state.zig");
+const recipe_store = @import("../recipe/store.zig");
+const recipe_ui = @import("../recipe/ui_state.zig");
 const quick_verify = @import("../assistant/quick_verify.zig");
 const window_backend = @import("../platform/window_backend.zig");
 const feishu_registration = @import("../feishu/registration.zig");
@@ -291,6 +294,7 @@ const PaletteItem = union(enum) {
     command: usize,
     snippet: usize,
     ssh_profile: usize,
+    recipe: usize,
     tmux_profile: usize,
     ai_profile: usize,
     theme: usize,
@@ -509,6 +513,8 @@ fn commandPaletteSetMode(mode: CommandPaletteMode) void {
 fn commandPaletteOpenWithMode(mode: CommandPaletteMode) void {
     freeSnippets(); // re-read snippet files on each open so edits show without restart
     snippetsState().loaded = false;
+    // Same for recipes: re-scan <config-dir>/recipes on each palette open.
+    if (AppWindow.g_allocator) |alloc| recipe_ui.invalidateRecipeList(alloc);
     if (!commandPaletteState().visible) {
         g_overlay_anim.palette_opened_at_ms = std.time.milliTimestamp();
         g_overlay_anim.palette_closing_at_ms = 0;
@@ -858,9 +864,11 @@ fn executeCommand(action: CommandAction) void {
         .load_openssh_config => loadOpenSshConfigDefault(),
         .new_agent => openDefaultAgentSessionFromCommandCenter(),
         .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
+        .send_to_copilot => _ = AppWindow.sendSelectionToCopilot(),
         .manage_ai_profiles => openAiListFromCommandPalette(),
         .manage_mcp_servers => openMcpServersFromCommandPalette(),
         .select_agent_history => commandPaletteOpenAgentHistory(),
+        .fork_session => AppWindow.forkActiveAiChatSession(null),
         .split_right => AppWindow.splitFocused(.right),
         .split_down => AppWindow.splitFocused(.down),
         .split_left => AppWindow.splitFocused(.left),
@@ -940,7 +948,33 @@ fn executeCommand(action: CommandAction) void {
         .run_memory_digest_now => {
             _ = AppWindow.runMemoryDigestNow();
         },
+        .show_prompt_queue => {
+            if (AppWindow.activeAiChat() orelse AppWindow.activeCopilotSessionForInput()) |session| {
+                session.togglePromptQueuePanel();
+                AppWindow.applyUiEffect(.repaint);
+            } else {
+                showStatusToast("No active AI session");
+            }
+        },
+        .clear_prompt_queue => {
+            if (AppWindow.activeAiChat() orelse AppWindow.activeCopilotSessionForInput()) |session| {
+                const cleared = session.clearPromptQueue();
+                var msg_buf: [48]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Cleared {d} queued prompt(s)", .{cleared}) catch "Prompt queue cleared";
+                showStatusToast(msg);
+            } else {
+                showStatusToast("No active AI session");
+            }
+        },
         .star_repo => openRepoStar(),
+        .save_workspace_recipe => openRecipeForm(),
+        .open_recipe => showStatusToast(i18n.s().toast_recipe_open_hint),
+        .import_recipe => {
+            if (AppWindow.g_allocator) |alloc| AppWindow.importWorkspaceRecipeFromFile(alloc);
+        },
+        .export_recipe => {
+            if (AppWindow.g_allocator) |alloc| AppWindow.exportCurrentWorkspaceRecipe(alloc);
+        },
     }
 }
 
@@ -1296,6 +1330,7 @@ test "command palette includes tmux profile actions for SSH profile search" {
 fn commandEntryKeybindAction(action: CommandAction) ?keybind.Action {
     return switch (action) {
         .new_tab => .new_session,
+        .send_to_copilot => .send_to_copilot,
         .split_right => .split_right,
         .split_down => .split_down,
         .focus_previous => .focus_previous,
@@ -1395,6 +1430,15 @@ fn rebuildPaletteScratch() void {
             g_palette_scratch_len += 1;
         }
     }
+    // Recipes are search-only results (like themes): typing a recipe name and
+    // pressing Enter restores it into a new window.
+    if (AppWindow.g_allocator) |alloc| recipe_ui.ensureRecipeList(alloc);
+    for (recipe_ui.recipeItems(), 0..) |info, recipe_idx| {
+        if (g_palette_scratch_len >= PALETTE_SCRATCH_CAP) break;
+        if (!command_palette_model.recipeNameMatchesFilter(info.name, filter)) continue;
+        g_palette_scratch[g_palette_scratch_len] = .{ .recipe = recipe_idx };
+        g_palette_scratch_len += 1;
+    }
     loadAiProfiles();
     for (0..assistantProfiles().profile_count) |ai_idx| {
         if (g_palette_scratch_len >= PALETTE_SCRATCH_CAP) break;
@@ -1416,10 +1460,17 @@ fn executePaletteItem(item: PaletteItem) void {
         .command => |cmd_idx| executeCommand(COMMAND_ENTRIES[cmd_idx].action),
         .snippet => |snippet_idx| sendSnippet(snippet_idx),
         .ssh_profile => |profile_idx| connectSshProfile(profile_idx),
+        .recipe => |recipe_idx| openRecipeFromPalette(recipe_idx),
         .tmux_profile => |profile_idx| connectSshProfileTmux(profile_idx),
         .ai_profile => |profile_idx| _ = spawnAiProfileWithAgentOverride(profile_idx, null),
         .theme => |ti| applyEmbeddedThemeFromPalette(ti),
     }
+}
+
+fn openRecipeFromPalette(recipe_idx: usize) void {
+    const items = recipe_ui.recipeItems();
+    if (recipe_idx >= items.len) return;
+    AppWindow.openRecipeInNewWindow(items[recipe_idx].path);
 }
 
 fn commandPaletteClearAgentHistoryRows() void {
@@ -2455,6 +2506,17 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
                         renderTitlebarText(suffix, suffix_right - suffix_w, text_y, shortcut_color);
                         renderTitlebarTextLimited(snippet.name, title_x, text_y, row_title_color, (suffix_right - suffix_w) - title_x - 18);
                     },
+                    .recipe => |recipe_idx| {
+                        const recipe_items = recipe_ui.recipeItems();
+                        if (recipe_idx >= recipe_items.len) continue;
+                        var title_buf: [recipe_store.NAME_MAX + 8]u8 = undefined;
+                        const recipe_title = std.fmt.bufPrint(title_buf[0..], "Recipe: {s}", .{recipe_items[recipe_idx].name}) catch "Recipe";
+                        const suffix = "  new window";
+                        const suffix_w = measureTitlebarText(suffix);
+                        const suffix_right = layout.box_x + layout.box_w - pad_x;
+                        renderTitlebarText(suffix, suffix_right - suffix_w, text_y, shortcut_color);
+                        renderTitlebarTextLimited(recipe_title, title_x, text_y, row_title_color, (suffix_right - suffix_w) - title_x - 18);
+                    },
                     .ssh_profile => |profile_idx| {
                         if (profile_idx >= sshState().profile_count) continue;
                         const profile = &sshState().profiles[profile_idx];
@@ -2577,6 +2639,7 @@ const SessionAction = enum {
     save_ai,
     feishu_save,
     feishu_scan,
+    recipe_save,
     cancel,
 };
 
@@ -2758,6 +2821,7 @@ fn commandCenterStateApply(state: command_center_state.State) void {
     // another launcher mode (AI list, SSH, plain launcher) reuses g_session_launcher_visible.
     feishuForm().visible = false;
     quickAiForm().visible = false;
+    recipe_ui.form().hide();
 }
 
 pub fn sessionLauncherOpen() void {
@@ -3029,6 +3093,13 @@ fn mcpProbeDone(ctx: *anyopaque, r: mcp_probe.Result) void {
 
 pub fn sessionLauncherInsertChar(codepoint: u21) void {
     if (codepoint < 0x20 or codepoint == 0x7f) return;
+    if (recipe_ui.form().visible) {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(codepoint, &buf) catch return;
+        recipe_ui.form().append(buf[0..n]);
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return;
+    }
     if (feishuForm().visible) {
         const field = feishuConfig().focusedField() orelse return;
         var buf: [4]u8 = undefined;
@@ -3065,6 +3136,11 @@ pub fn sessionLauncherInsertChar(codepoint: u21) void {
 }
 
 pub fn sessionLauncherPasteText(text: []const u8) bool {
+    if (recipe_ui.form().visible) {
+        recipe_ui.form().append(text);
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return true;
+    }
     if (feishuForm().visible) {
         const field = feishuConfig().focusedField() orelse return false;
         feishuConfig().append(field, text);
@@ -3136,6 +3212,18 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) AppWindow.UiEffect {
 }
 
 fn sessionLauncherHandleKeyImpl(ev: input_key.KeyEvent) void {
+    if (recipe_ui.form().visible) {
+        switch (ev.key) {
+            .tab, .arrow_down => recipe_ui.form().focusNextRow(),
+            .arrow_up => recipe_ui.form().focusPrevRow(),
+            .enter => submitRecipeForm(),
+            .backspace => recipe_ui.form().backspace(),
+            .escape => closeRecipeForm(),
+            else => {},
+        }
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return;
+    }
     if (feishuForm().visible) {
         switch (ev.key) {
             .tab, .arrow_down => feishuConfig().focusNextRow(),
@@ -3321,6 +3409,7 @@ pub fn sessionLauncherExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_
         .save_ai => saveAiFormOnly(),
         .feishu_save => saveFeishuConfig(),
         .feishu_scan => startFeishuRegistration(),
+        .recipe_save => submitRecipeForm(),
         .cancel => sessionLauncherBackOrClose(),
     }
     return true;
@@ -4626,6 +4715,42 @@ fn closeQuickAiForm() void {
     AppWindow.applyUiEffect(.{ .needs_rebuild = true });
 }
 
+// ============================================================================
+// Workspace recipe naming form (single-line, inside the session-launcher box)
+// ============================================================================
+
+pub fn openRecipeForm() void {
+    g_ssh_list_visible = false;
+    g_ssh_form_visible = false;
+    g_ai_list_visible = false;
+    g_ai_form_visible = false;
+    g_ai_history_source_visible = false;
+    settingsState().visible = false;
+    commandPaletteClose(); // the commit hides the recipe form; show() below re-sets it
+    g_session_launcher_visible = true;
+    recipe_ui.form().show();
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+}
+
+fn closeRecipeForm() void {
+    recipe_ui.form().hide();
+    g_session_launcher_visible = false;
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+}
+
+fn submitRecipeForm() void {
+    var name_buf: [recipe_store.NAME_MAX]u8 = undefined;
+    const name = recipe_store.sanitizeName(&name_buf, recipe_ui.form().name()) orelse {
+        showStatusToast(i18n.s().toast_recipe_invalid_name);
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return;
+    };
+    const allocator = AppWindow.g_allocator orelse return;
+    if (AppWindow.saveWorkspaceRecipe(allocator, name)) {
+        closeRecipeForm();
+    }
+}
+
 fn openQuickAiUrl(url: []const u8) void {
     if (AppWindow.g_allocator) |alloc| _ = platform_open_url.open(alloc, .{ .url = url });
 }
@@ -5486,6 +5611,7 @@ fn sessionTwoColumnWidth(left: []const u8, right: []const u8) f32 {
 }
 
 fn sessionLauncherTitle() []const u8 {
+    if (recipe_ui.form().visible) return i18n.s().recipe_form_title;
     if (feishuForm().visible) return i18n.s().feishu_form_title;
     if (quickAiForm().visible) return i18n.s().quick_ai_form_title;
     if (g_ai_history_source_visible) return i18n.s().sl_sessions;
@@ -5514,6 +5640,7 @@ fn sessionLauncherTitle() []const u8 {
 }
 
 fn sessionLauncherHint() []const u8 {
+    if (recipe_ui.form().visible) return i18n.s().recipe_form_hint;
     if (feishuForm().visible) return i18n.s().toast_feishu_restart;
     if (g_ai_history_source_visible) return "Choose a source";
     if (g_ai_form_visible) {
@@ -5671,7 +5798,9 @@ fn sessionDesiredBoxWidth() f32 {
 
 /// Total rows in the currently active session-launcher mode.
 fn sessionActiveRowCount() usize {
-    return if (feishuForm().visible)
+    return if (recipe_ui.form().visible)
+        recipe_form_state.ROW_COUNT
+    else if (feishuForm().visible)
         FEISHU_ROW_COUNT
     else if (quickAiForm().visible)
         quick_ai_config.ROW_COUNT
@@ -5691,7 +5820,9 @@ fn sessionActiveRowCount() usize {
 
 /// Selected/focused row of the currently active session-launcher mode.
 fn sessionActiveSelection() usize {
-    return if (feishuForm().visible)
+    return if (recipe_ui.form().visible)
+        recipe_ui.form().focus
+    else if (feishuForm().visible)
         feishuConfig().focus
     else if (quickAiForm().visible)
         quickAi().focus
@@ -5711,7 +5842,9 @@ fn sessionActiveSelection() usize {
 
 /// Mutable pointer to the active mode's selection (for the mouse wheel).
 fn sessionActiveSelectionPtr() *usize {
-    return if (feishuForm().visible)
+    return if (recipe_ui.form().visible)
+        &recipe_ui.form().focus
+    else if (feishuForm().visible)
         &feishuConfig().focus
     else if (quickAiForm().visible)
         &quickAi().focus
@@ -5788,6 +5921,14 @@ fn sessionHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, t
     const visible_index: usize = @intFromFloat(@floor((y - layout.first_row_top_px) / layout.row_h));
     if (visible_index >= layout.visible_rows) return null;
     const row = visible_index + layout.scroll;
+
+    if (recipe_ui.form().visible) {
+        if (row >= recipe_form_state.ROW_COUNT) return null;
+        recipe_ui.form().focus = row;
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        if (row == recipe_form_state.ROW_SAVE) return .recipe_save;
+        return null;
+    }
 
     if (feishuForm().visible) {
         if (row >= FEISHU_ROW_COUNT) return null;
@@ -6002,6 +6143,14 @@ fn quickAiStatusText() []const u8 {
     };
 }
 
+// Draws the recipe naming form inside the session-launcher box: one plain-text
+// name row plus a Save row (modeled on renderQuickAiConfigForm).
+fn renderRecipeForm(layout: SessionLayout, window_height: f32) void {
+    const st = recipe_ui.form();
+    renderSessionRow(layout, window_height, recipe_form_state.ROW_NAME, i18n.s().recipe_name_label, st.name(), st.focus == recipe_form_state.ROW_NAME);
+    renderSessionRow(layout, window_height, recipe_form_state.ROW_SAVE, i18n.s().recipe_save_row, "", st.focus == recipe_form_state.ROW_SAVE);
+}
+
 // Draws the quick-configure AI form inside the session-launcher box.
 // The API key row is masked: rendered as U+2022 (•) repeated once per codepoint
 // (continuation bytes are skipped, so the dot count matches the codepoint count,
@@ -6133,6 +6282,11 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
         const text = if (filter.len > 0) filter else i18n.s().sl_search_ssh_servers;
         const color = if (filter.len > 0) fg else dim_color;
         renderTitlebarTextLimited(text, filter_x + 12, rowTextY(filter_box_y, layout.filter_h), color, filter_w - 24);
+    }
+
+    if (recipe_ui.form().visible) {
+        renderRecipeForm(layout, window_height);
+        return;
     }
 
     if (feishuForm().visible) {

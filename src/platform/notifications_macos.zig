@@ -10,6 +10,10 @@ pub fn bell() void {
     wispterm_macos_notification_bell();
 }
 
+pub fn bindWindow(handle: platform_window.NativeHandle) void {
+    _ = handle;
+}
+
 pub fn requestAttention(handle: platform_window.NativeHandle) void {
     wispterm_macos_notification_request_attention(handle);
 }
@@ -26,3 +30,18 @@ pub fn notificationAuthStatus() u8 {
 pub fn requestNotificationAuth() void {
     wispterm_macos_notif_request_auth();
 }
+
+/// macOS click-to-focus is handled by UNUserNotificationCenter, not a tray callback.
+pub fn handleCallback(
+    msg: platform_window.MessageId,
+    wparam: platform_window.WordParam,
+    lparam: platform_window.LongParam,
+) bool {
+    _ = msg;
+    _ = wparam;
+    _ = lparam;
+    return false;
+}
+
+/// macOS notifications need no process-level teardown.
+pub fn cleanup() void {}

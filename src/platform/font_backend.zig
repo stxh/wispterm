@@ -42,6 +42,10 @@ pub const TitlebarIcon = enum {
     maximize,
     minimize,
     restore,
+    menu,
+    settings,
+    help,
+    copilot,
 };
 
 pub fn discoveryDisplayName() []const u8 {
@@ -111,6 +115,10 @@ test "platform font backend owns titlebar icon glyph mapping" {
     try std.testing.expect(titlebarIconGlyph(.maximize) != 0);
     try std.testing.expect(titlebarIconGlyph(.restore) != 0);
     try std.testing.expect(titlebarIconGlyph(.maximize) != titlebarIconGlyph(.restore));
+    try std.testing.expect(titlebarIconGlyph(.menu) != 0);
+    try std.testing.expect(titlebarIconGlyph(.settings) != 0);
+    try std.testing.expect(titlebarIconGlyph(.help) != 0);
+    try std.testing.expect(titlebarIconGlyph(.copilot) != 0);
 }
 
 test "platform font backend selects backend by target OS" {

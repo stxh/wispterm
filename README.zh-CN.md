@@ -35,7 +35,11 @@
 - **AI 智能体会话** —— 启动 OpenAI 兼容的智能体标签页，配置 profile、恢复历史，导出完整或精简的 Markdown 对话记录
 - **命令中心副驾历史** —— 搜索已保存的 AI Chat 与 Copilot 侧栏对话，按日期分组，并可按侧栏/标签页来源筛选
 - **会话内切换模型** —— 输入 `/model` 或点击模型标签，把当前 AI Chat/Copilot 会话切到另一个已保存 profile，并用摘要交接上下文
-- **AI 历史浏览器** —— 浏览本地、WSL 与 SSH 上的 Codex / Claude Code / Reasonix 历史，并从原始项目目录恢复会话
+- **Prompt 队列** —— Copilot 请求进行中提交的 prompt 自动排队，会话空闲后按序发送；队列面板里可查看、重排、编辑或删除
+- **Send to Chat** —— 把终端选中文本（或最近输出）作为折叠上下文卡片发给 Copilot，可走命令面板或可绑定的 `send_to_copilot` 快捷键动作
+- **分叉会话** —— 在任意 rewind 点复制当前 AI 对话（rewind 选择器按 `f`，或从命令面板整体复制），带着共享历史分别尝试不同方案
+- **工作区 Recipe** —— 把当前窗口的标签/分屏布局保存为命名 recipe，从命令面板一键恢复到新窗口，并可导出/导入 recipe JSON 文件分享工作环境
+- **AI 历史浏览器** —— 浏览本地、WSL 与 SSH 上的 Codex / Claude Code / Kimi Code / OpenCode 历史，并从原始项目目录恢复会话
 - **Kitty 图形协议** —— 通过 `imgcat.py` / `pdfcat.py` 在远程 shell 中内联显示图片和 PDF
 - **可选的远程访问** —— 通过 Cloudflare 托管的中继分享会话密钥（默认关闭）
 
@@ -53,7 +57,7 @@
 
 ## 版本
 
-桌面应用版本来自仓库根目录的 `build.zig.zon`（当前为 `1.34.0`），也是
+桌面应用版本来自仓库根目录的 `build.zig.zon`（当前为 `1.36.0`），也是
 `wispterm --version`、release notes、桌面发布包和命令中心 `Version` 条目使用的版本。
 
 `remote/` 下的 WispTerm Remote 网页控制台/中继有独立的 npm/web 版本（当前为
@@ -263,7 +267,7 @@ MIT
 
 ## 引用
 
-Xu, Z.-G. (2026). *WispTerm* (Version 1.34.0) [Computer software]. Zenodo.
+Xu, Z.-G. (2026). *WispTerm* (Version 1.36.0) [Computer software]. Zenodo.
 https://doi.org/10.5281/zenodo.20660541
 
 可直接复制的致谢模板：
@@ -272,6 +276,6 @@ https://doi.org/10.5281/zenodo.20660541
 我们在生命科学数据分析中使用 WispTerm 作为计算环境的一部分，用于远程计算流程、
 可重复的命令行处理，以及相关文献与分析代码的整理。
 
-Xu, Z.-G. (2026). WispTerm (Version 1.34.0) [Computer software]. Zenodo.
+Xu, Z.-G. (2026). WispTerm (Version 1.36.0) [Computer software]. Zenodo.
 https://doi.org/10.5281/zenodo.20660541
 ```

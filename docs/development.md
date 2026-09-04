@@ -601,8 +601,10 @@ Several GitHub Actions workflows publish release assets whenever a tag matching
 - `wispterm-windows-debug-vX.Y.Z.zip`
 
 When WispTerm detects a newer release on Windows, it downloads the matching
-portable zip to the Downloads folder and reveals it in Explorer; unzip it over
-your existing install to update.
+portable zip to the Downloads folder and reveals it in Explorer. Unzip the
+archive and double-click `Replace-WispTerm.cmd` to overwrite the Start-menu
+install (or to copy into `%LOCALAPPDATA%\Programs\WispTerm` and create that
+shortcut). You can still unzip over the existing folder by hand.
 
 WispTerm does not build or publish a Windows installer. Use the default portable
 zip release asset; the `portable-compat` zip when using the embedded browser panel

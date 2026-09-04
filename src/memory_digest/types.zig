@@ -3,13 +3,11 @@
 const std = @import("std");
 const ai_types = @import("../terminal_agents/sessions/types.zig");
 
-/// Providers the digest scans. Superset of the AI-history browser's
-/// ProviderId: adds WispTerm's own copilot history.
+/// Providers supported by the digest, including WispTerm's own copilot history.
 pub const DigestProvider = enum {
     wispterm,
     claude,
     codex,
-    reasonix,
 };
 
 /// One session carrying only the messages that are new since the last run.

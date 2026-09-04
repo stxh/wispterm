@@ -28,6 +28,7 @@ const surface_registry = @import("surface_registry.zig");
 const platform_process = @import("platform/process.zig");
 const ssh_connection_mod = @import("ssh/connection.zig");
 const clipboard_osc52 = @import("clipboard_osc52.zig");
+const osc_title = @import("osc_title.zig");
 
 const Surface = @This();
 const io_log = std.log.scoped(.surface_io);
@@ -87,9 +88,6 @@ pub const IoState = union(enum) {
     exited: ExitInfo,
     failed: IoFailure,
 };
-
-/// OSC parser state machine — handles sequences split across PTY reads.
-const OscParseState = enum { ground, esc, osc_num, osc_semi, osc_title };
 
 const ImageOscParseState = enum {
     ground,
@@ -381,11 +379,7 @@ window_title_len: usize = 0,
 /// Set via double-click on tab or keyboard shortcut. Clear by setting len to 0.
 title_override: [256]u8 = undefined,
 title_override_len: usize = 0,
-osc_state: OscParseState = .ground,
-osc_is_title: bool = false,
-osc_num: u8 = 0,
-osc_buf: [512]u8 = undefined,
-osc_buf_len: usize = 0,
+title_osc: osc_title.Scanner = .{},
 osc7_title: [256]u8 = undefined,
 osc7_title_len: usize = 0,
 got_osc7_this_batch: bool = false,
@@ -563,10 +557,7 @@ fn finishInit(
     // Init OSC state
     surface.window_title_len = 0;
     surface.title_override_len = 0;
-    surface.osc_state = .ground;
-    surface.osc_is_title = false;
-    surface.osc_num = 0;
-    surface.osc_buf_len = 0;
+    surface.title_osc = .{};
     surface.osc7_title_len = 0;
     surface.got_osc7_this_batch = false;
     surface.wispterm_image_osc_state = .ground;
@@ -1772,62 +1763,11 @@ fn handleWispTermImageOsc(self: *Surface) void {
 /// Scan PTY output for OSC 0/1/2/7 title sequences.
 /// Handles sequences split across multiple reads via state machine.
 pub fn scanForOscTitle(self: *Surface, data: []const u8) void {
-    for (data) |byte| {
-        switch (self.osc_state) {
-            .ground => {
-                if (byte == 0x1b) {
-                    self.osc_state = .esc;
-                }
-            },
-            .esc => {
-                if (byte == ']') {
-                    self.osc_state = .osc_num;
-                    self.osc_is_title = false;
-                } else {
-                    self.osc_state = .ground;
-                }
-            },
-            .osc_num => {
-                if (byte == '0' or byte == '1' or byte == '2' or byte == '7') {
-                    self.osc_is_title = true;
-                    self.osc_num = byte;
-                    self.osc_state = .osc_semi;
-                } else if (byte >= '0' and byte <= '9') {
-                    self.osc_is_title = false;
-                    self.osc_num = byte;
-                    self.osc_state = .osc_semi;
-                } else {
-                    self.osc_state = .ground;
-                }
-            },
-            .osc_semi => {
-                if (byte == ';') {
-                    if (self.osc_is_title) {
-                        self.osc_buf_len = 0;
-                        self.osc_state = .osc_title;
-                    } else {
-                        self.osc_state = .ground;
-                    }
-                } else if (byte >= '0' and byte <= '9') {
-                    // Multi-digit OSC number, stay in osc_semi
-                } else {
-                    self.osc_state = .ground;
-                }
-            },
-            .osc_title => {
-                if (byte == 0x07) {
-                    self.updateTitle(self.osc_buf[0..self.osc_buf_len], self.osc_num);
-                    self.osc_state = .ground;
-                } else if (byte == 0x1b) {
-                    self.updateTitle(self.osc_buf[0..self.osc_buf_len], self.osc_num);
-                    self.osc_state = .esc;
-                } else if (self.osc_buf_len < self.osc_buf.len) {
-                    self.osc_buf[self.osc_buf_len] = byte;
-                    self.osc_buf_len += 1;
-                }
-            },
-        }
-    }
+    self.title_osc.feed(data, self, onTitleOscEvent);
+}
+
+fn onTitleOscEvent(self: *Surface, event: osc_title.Event) void {
+    self.updateTitle(event.text, event.code);
 }
 
 /// Update the surface title from an OSC sequence.
@@ -1838,7 +1778,7 @@ fn updateTitle(self: *Surface, title: []const u8, osc_num: u8) void {
     if (title.len == 0) return;
     if (!std.unicode.utf8ValidateSlice(title)) return;
 
-    if (osc_num == '7') {
+    if (osc_num == 7) {
         // OSC 7: file://host/path — extract the path
         self.got_osc7_this_batch = true;
         const prefix = "file://";

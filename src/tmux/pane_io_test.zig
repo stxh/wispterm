@@ -77,7 +77,7 @@ test "PaneMap.removePane unregisters the pane and closes its controller" {
     map.sink().write(5, "gone");
 }
 
-test "pumpKeystrokes forwards a pane's keystrokes as a hex send-keys" {
+test "pumpKeystrokes forwards keystrokes as tmux-compatible key names" {
     const alloc = std.testing.allocator;
     var pair = try pty.Pty.openVirtual(.{ .ws_col = 80, .ws_row = 24 });
     defer pair.pty.deinit();
@@ -90,10 +90,11 @@ test "pumpKeystrokes forwards a pane's keystrokes as a hex send-keys" {
     defer s.deinit();
 
     // The Surface writes keystrokes into its pty; the bytes surface on the
-    // controller side, which the pump turns into a hex send-keys for pane %4.
+    // controller side, which the pump turns into hexadecimal key names for
+    // pane %4 (compatible with tmux 2.7 and newer).
     try pair.pty.writeInput("ls\n"); // l=6c s=73 \n=0a
     try map.pumpKeystrokes(&s);
-    try std.testing.expectEqualStrings("send-keys -t %4 -H 6c 73 0a\n", s.pendingCommands());
+    try std.testing.expectEqualStrings("send-keys -t %4 0x6c 0x73 0xa\n", s.pendingCommands());
 }
 
 test "pumpKeystrokes routes each pane to its own pane id" {
@@ -116,8 +117,8 @@ test "pumpKeystrokes routes each pane to its own pane id" {
     try map.pumpKeystrokes(&s);
 
     const cmds = s.pendingCommands();
-    try std.testing.expect(std.mem.indexOf(u8, cmds, "send-keys -t %1 -H 78\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmds, "send-keys -t %2 -H 79\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmds, "send-keys -t %1 0x78\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmds, "send-keys -t %2 0x79\n") != null);
 }
 
 test "pumpKeystrokes is a no-op when no keystrokes are pending" {

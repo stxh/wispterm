@@ -496,7 +496,8 @@ fn renderList(
             .all => "No sessions match filter",
             .codex => "No Codex sessions",
             .claude => "No Claude Code sessions",
-            .reasonix => "No Reasonix sessions",
+            .kimi => "No Kimi sessions",
+            .opencode => "No OpenCode sessions",
             .subagent => "No Subagent sessions",
         };
         _ = draw.renderTextLimited(empty, layout.list_x + PAD_X, yTextFromTop(draw, window_height, row_top + 24), muted, layout.list_w - PAD_X * 2);
@@ -1238,13 +1239,19 @@ test "terminal agent sessions renderer: interaction hit test maps category rows"
         interactionHitTest(session, 1000, 700, top, 0, 1000, cell_h, 10, layout.left_x + 10, claude_y),
     );
 
-    const reasonix_y = lc.category_rows_top + lc.category_row_h * 3.5;
+    const kimi_y = lc.category_rows_top + lc.category_row_h * 3.5;
     try std.testing.expectEqual(
-        Hit{ .category = .reasonix },
-        interactionHitTest(session, 1000, 700, top, 0, 1000, cell_h, 10, layout.left_x + 10, reasonix_y),
+        Hit{ .category = .kimi },
+        interactionHitTest(session, 1000, 700, top, 0, 1000, cell_h, 10, layout.left_x + 10, kimi_y),
     );
 
-    const subagent_y = lc.category_rows_top + lc.category_row_h * 4.5;
+    const opencode_y = lc.category_rows_top + lc.category_row_h * 4.5;
+    try std.testing.expectEqual(
+        Hit{ .category = .opencode },
+        interactionHitTest(session, 1000, 700, top, 0, 1000, cell_h, 10, layout.left_x + 10, opencode_y),
+    );
+
+    const subagent_y = lc.category_rows_top + lc.category_row_h * 5.5;
     try std.testing.expectEqual(
         Hit{ .category = .subagent },
         interactionHitTest(session, 1000, 700, top, 0, 1000, cell_h, 10, layout.left_x + 10, subagent_y),

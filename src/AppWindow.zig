@@ -39,6 +39,7 @@ const platform_window_state = @import("platform/window_state.zig");
 const platform_wsl = @import("platform/wsl.zig");
 const startup_tabs = @import("startup_tabs.zig");
 const session_persist = @import("session_persist.zig");
+const recipe_store = @import("recipe/store.zig");
 const quick_terminal = @import("quick_terminal.zig");
 const keybind = @import("keybind.zig");
 const thread_message = @import("appwindow/thread_message.zig");
@@ -49,6 +50,8 @@ const render_diagnostics = @import("render_diagnostics.zig");
 const ime_caret = @import("ime_caret.zig");
 const hit_test = @import("input/hit_test.zig");
 pub const ai_chat = @import("assistant/conversation/session.zig");
+const conversation_fork = @import("assistant/conversation/fork.zig");
+const session_identity = @import("assistant/conversation/identity.zig");
 const ai_chat_types = @import("assistant/conversation/types.zig");
 const ai_history_cache = @import("terminal_agents/sessions/cache.zig");
 const ai_history_resume = @import("terminal_agents/sessions/resume.zig");
@@ -106,6 +109,8 @@ const frame_latency = @import("appwindow/frame_latency.zig");
 const flush_scheduler = @import("appwindow/flush_scheduler.zig");
 const resize_throttle = @import("appwindow/resize_throttle.zig");
 const surface_snapshots = @import("appwindow/surface_snapshots.zig");
+const remote_snapshot = @import("remote_snapshot.zig");
+const send_to_chat = @import("send_to_chat.zig");
 const control_api = @import("appwindow/control_api.zig");
 const remote_sync = @import("appwindow/remote_sync.zig");
 const weixin_bridge = @import("appwindow/chatops_bridge.zig");
@@ -155,6 +160,10 @@ allocator: std.mem.Allocator,
 app: *App,
 native_handle_bits: std.atomic.Value(usize) = .init(0),
 force_close_requested: std.atomic.Value(bool) = .init(false),
+// Recipe staged for this window by App.requestNewWindowWithRecipe; consumed
+// once by the startup branch in runMainLoop.
+initial_recipe_path: [std.fs.max_path_bytes]u8 = undefined,
+initial_recipe_path_len: usize = 0,
 
 /// Initialize an AppWindow with the given App.
 pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
@@ -217,6 +226,14 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
             }
             overlays.openBtwConversation(source, prompt);
             applyUiEffect(.repaint);
+        }
+    }.cb);
+    // Rewind picker `f`: fork the session before the selected user message
+    // (the source session stays intact). The payload ordinal is already mapped
+    // to record user-message counting by the session layer.
+    ai_chat.setForkAtRewindTrigger(struct {
+        fn cb(session: *ai_chat.Session, user_point: usize) void {
+            forkAiChatSession(session, user_point);
         }
     }.cb);
     app.maybeStartStartupUpdateCheck();
@@ -303,10 +320,14 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     // Get initial CWD for this window (if any) - copy into thread-local buffer
     g_initial_cwd_len = app.takeInitialCwd(&g_initial_cwd_buf);
 
-    return AppWindow{
+    var window = AppWindow{
         .allocator = allocator,
         .app = app,
     };
+    // Get the staged recipe path for this window (if any). Stored on the
+    // struct, not a threadlocal, so the source-guard global count is untouched.
+    window.initial_recipe_path_len = app.takeInitialRecipePath(&window.initial_recipe_path);
+    return window;
 }
 
 /// Run the window's main loop. Blocks until the window is closed.
@@ -2142,11 +2163,19 @@ fn renderPortForwardingFrame(active_tab: *TabState, fb_width: c_int, fb_height: 
         .none, .form => "",
         .confirm_delete => |*c| c.text,
     };
+    var profile_name_slices: [port_forwarding.PROFILE_LIST_MAX][]const u8 = undefined;
     const form_view: ?port_forwarding_renderer.FormView = switch (session.model.overlay) {
-        .form => |form| .{
-            .mode = if (form.mode == .new) "New forwarding rule" else "Edit forwarding rule",
-            .focus = form.focus,
-            .rule = form.rule,
+        .form => |*form| blk: {
+            const count = @min(form.profile_count, profile_name_slices.len);
+            for (0..count) |i| profile_name_slices[i] = form.profileNameAt(i);
+            break :blk .{
+                .mode = if (form.mode == .new) "New forwarding rule" else "Edit forwarding rule",
+                .focus = form.focus,
+                .rule = form.rule,
+                .profile_names = profile_name_slices[0..count],
+                .profile_index = form.profile_index,
+                .profile_list_title = i18n.s().pf_profile_list,
+            };
         },
         else => null,
     };
@@ -2468,25 +2497,32 @@ pub fn portForwardingToggleAutoStart() bool {
 
 pub fn portForwardingOpenNew() bool {
     const session = activePortForwarding() orelse return false;
-    var name_buf: [port_forward_rule.PROFILE_MAX]u8 = undefined;
-    const default_profile = firstSshProfileName(&name_buf);
+    var names_store: [port_forwarding.PROFILE_LIST_MAX][ssh_profile_store.LIST_NAME_MAX]u8 = undefined;
+    var name_lens: [port_forwarding.PROFILE_LIST_MAX]usize = undefined;
+    var name_slices: [port_forwarding.PROFILE_LIST_MAX][]const u8 = undefined;
+    const names = snapshotSshProfileNames(&names_store, &name_lens, &name_slices);
+    const default_profile = if (names.len > 0) names[0] else "";
     session.mutex.lock();
     defer session.mutex.unlock();
     session.model.openNewForm(default_profile) catch return false;
+    if (session.model.form()) |form| form.setProfileChoices(names);
     markUiDirty();
     return true;
 }
 
-/// Name of the first SSH profile in the store, written into `buf` (the returned
-/// slice points into `buf`, not the freed file content). Returns "" when no
-/// profiles exist or the store can't be read. Used to preselect the Profile
-/// selector when opening a new forwarding rule.
-fn firstSshProfileName(buf: []u8) []const u8 {
-    const manager = activePortForwardManager() orelse return "";
-    const allocator = manager.allocator;
-    const content = readSshHostsContent(allocator) orelse return "";
-    defer allocator.free(content);
-    return ssh_profile_store.cycleProfileName(content, "", 0, buf);
+fn snapshotSshProfileNames(
+    names_store: *[port_forwarding.PROFILE_LIST_MAX][ssh_profile_store.LIST_NAME_MAX]u8,
+    name_lens: *[port_forwarding.PROFILE_LIST_MAX]usize,
+    name_slices: *[port_forwarding.PROFILE_LIST_MAX][]const u8,
+) []const []const u8 {
+    const manager = activePortForwardManager() orelse return name_slices[0..0];
+    const content = readSshHostsContent(manager.allocator) orelse return name_slices[0..0];
+    defer manager.allocator.free(content);
+    const count = ssh_profile_store.listProfileNames(content, names_store, name_lens);
+    for (0..count) |i| {
+        name_slices[i] = names_store[i][0..name_lens[i]];
+    }
+    return name_slices[0..count];
 }
 
 /// Test seam: when set, readSshHostsContent serves a copy of this instead of
@@ -2512,10 +2548,15 @@ pub fn portForwardingOpenEdit() bool {
     const idx = session.model.sel_row;
     session.mutex.unlock();
     const row = manager.rowAt(idx) orelse return false;
+    var names_store: [port_forwarding.PROFILE_LIST_MAX][ssh_profile_store.LIST_NAME_MAX]u8 = undefined;
+    var name_lens: [port_forwarding.PROFILE_LIST_MAX]usize = undefined;
+    var name_slices: [port_forwarding.PROFILE_LIST_MAX][]const u8 = undefined;
+    const names = snapshotSshProfileNames(&names_store, &name_lens, &name_slices);
 
     session.mutex.lock();
     defer session.mutex.unlock();
     session.model.openEditForm(idx, row.rule) catch return false;
+    if (session.model.form()) |form| form.setProfileChoices(names);
     markUiDirty();
     return true;
 }
@@ -2603,53 +2644,20 @@ pub fn portForwardingFormMove(delta: isize) bool {
 }
 
 /// Adjust the focused selector field by `delta` steps. Profile cycles through
-/// the SSH profiles in the store; Direction and Auto start flip. Other
-/// (text/port) fields are unaffected. Used by Space (+1) and the ←/→ arrows.
+/// the SSH profiles snapshotted onto the form; Direction and Auto start flip.
+/// Other (text/port) fields are unaffected. Used by Space (+1) and the ←/→ arrows.
 pub fn portForwardingFormAdjust(delta: isize) bool {
     const session = activePortForwarding() orelse return false;
-
-    // Determine the focused field and the current profile name without holding
-    // the lock across the ssh_hosts file read below.
-    session.mutex.lock();
-    const focus = if (session.model.form()) |form| form.focus else {
-        session.mutex.unlock();
-        return false;
-    };
-    var current_buf: [port_forward_rule.PROFILE_MAX]u8 = undefined;
-    var current_len: usize = 0;
-    if (focus == port_forwarding.FIELD_PROFILE) {
-        const form = session.model.form().?;
-        const current = form.rule.profileName();
-        current_len = @min(current_buf.len, current.len);
-        @memcpy(current_buf[0..current_len], current[0..current_len]);
-    }
-    session.mutex.unlock();
-
-    if (focus == port_forwarding.FIELD_PROFILE) {
-        const manager = activePortForwardManager() orelse return false;
-        const allocator = manager.allocator;
-        const content = readSshHostsContent(allocator) orelse return false;
-        defer allocator.free(content);
-        var next_buf: [port_forward_rule.PROFILE_MAX]u8 = undefined;
-        const next = ssh_profile_store.cycleProfileName(content, current_buf[0..current_len], delta, &next_buf);
-        if (next.len == 0) return false;
-
-        session.mutex.lock();
-        defer session.mutex.unlock();
-        const form = session.model.form() orelse return false;
-        // The lock was released across the ssh_hosts read; re-verify the
-        // Profile field still has focus before writing the cycled name.
-        if (form.focus != port_forwarding.FIELD_PROFILE) return false;
-        form.rule.setProfileName(next);
-        markUiDirty();
-        return true;
-    }
-
     session.mutex.lock();
     defer session.mutex.unlock();
     const form = session.model.form() orelse return false;
-    if (form.focus != port_forwarding.FIELD_DIRECTION and form.focus != port_forwarding.FIELD_AUTO_START) return false;
-    form.toggleFocused();
+    switch (form.focus) {
+        port_forwarding.FIELD_PROFILE => {
+            if (!form.cycleProfile(delta)) return false;
+        },
+        port_forwarding.FIELD_DIRECTION, port_forwarding.FIELD_AUTO_START => form.toggleFocused(),
+        else => return false,
+    }
     markUiDirty();
     return true;
 }
@@ -3587,7 +3595,7 @@ pub fn aiHistoryAttachSelectedToCopilot() bool {
     };
     defer context.deinit(allocator);
 
-    const target = ensureAiHistoryCopilotTarget() orelse return true;
+    const target = ensureCopilotContextTarget() orelse return true;
     const title_text = std.fmt.allocPrint(
         allocator,
         "AI History: {s} {s}",
@@ -3612,6 +3620,82 @@ pub fn aiHistoryAttachSelectedToCopilot() bool {
         return showAiHistoryActionToast("Attached AI History to Copilot; truncated");
     }
     return showAiHistoryActionToast("Attached AI History to Copilot");
+}
+
+fn showSendToChatToast(message: []const u8) bool {
+    overlays.showStatusToast(message);
+    markUiDirty();
+    return true;
+}
+
+/// Send to Chat: attach the active terminal selection — or, with no selection,
+/// the last `send_to_chat.recent_output_lines` lines of recent output — to a
+/// Copilot session as a collapsed context card. Target priority matches the AI
+/// History attach flow: active AI chat tab, then the visible copilot sidebar,
+/// then a freshly spawned Copilot tab. Returns true once the action was
+/// handled (a toast explains any failure), false only without an allocator.
+pub fn sendSelectionToCopilot() bool {
+    const allocator = g_allocator orelse return false;
+
+    var from_selection = true;
+    var source: ?[]u8 = input.allocActiveSelectionText(allocator);
+    if (source == null) {
+        from_selection = false;
+        const surface = activeSurface() orelse
+            return showSendToChatToast("Nothing to send: no selection or terminal output");
+        source = surface_snapshots.buildRemoteSurfaceSnapshot(
+            allocator,
+            surface,
+            remote_snapshot.agent_max_history_rows,
+        ) catch |err| {
+            log.warn("failed to snapshot active surface for Send to Chat: {}", .{err});
+            return showSendToChatToast("Send to Chat failed");
+        };
+    }
+    defer allocator.free(source.?);
+
+    const content = if (from_selection)
+        std.mem.trimRight(u8, source.?, "\n")
+    else
+        send_to_chat.tailLines(source.?, send_to_chat.recent_output_lines);
+    if (std.mem.trim(u8, content, " \t\r\n").len == 0)
+        return showSendToChatToast("Nothing to send: no selection or terminal output");
+
+    var body = send_to_chat.allocFencedBody(allocator, content, send_to_chat.max_body_bytes) catch |err| {
+        log.warn("failed to build Send to Chat context body: {}", .{err});
+        return showSendToChatToast("Send to Chat failed");
+    };
+    defer body.deinit(allocator);
+
+    const target = ensureCopilotContextTarget() orelse return true;
+    const title_text: []const u8 = if (from_selection) "Terminal Selection" else "Terminal Recent Output";
+    target.appendContextCard(title_text, body.text, true) catch |err| {
+        log.warn("failed to send terminal context to Copilot: {}", .{err});
+        const message = switch (err) {
+            error.SessionBusy => "Copilot is busy",
+            error.SessionClosing => "Copilot session is closing",
+            else => "Send to Chat failed",
+        };
+        return showSendToChatToast(message);
+    };
+
+    // Focus the composer that received the card. A chat-tab target is already
+    // the active tab (an existing one, or the freshly spawned one); a sidebar
+    // target needs the input focus flag.
+    if (activeAiChat() != target and activeCopilotSessionForInput() == target) {
+        input.focusAiCopilot();
+    }
+
+    if (body.truncated) {
+        return showSendToChatToast(if (from_selection)
+            "Sent selection to Copilot; truncated"
+        else
+            "Sent recent output to Copilot; truncated");
+    }
+    return showSendToChatToast(if (from_selection)
+        "Sent selection to Copilot"
+    else
+        "Sent recent output to Copilot");
 }
 
 fn activeMarkdownExportSession() ?*ai_chat.Session {
@@ -3676,6 +3760,97 @@ fn copyAiChatMarkdown(session: *ai_chat.Session, mode: ai_chat.MarkdownExportMod
     }
 }
 
+/// Fork the active built-in Copilot conversation (the active AI chat tab first,
+/// then the visible sidebar session) into a new independent session that keeps
+/// every message before the fork point; the two sessions diverge from there.
+/// `fork_at_user_point` is the 0-based user-message ordinal to fork before
+/// (rewind picker `f`); null forks at the end (command palette "Fork Session").
+pub fn forkActiveAiChatSession(fork_at_user_point: ?usize) void {
+    const session = activeAiChat() orelse activeCopilotSessionForInput() orelse {
+        overlays.showStatusToast("No active Copilot session to fork");
+        markUiDirty();
+        return;
+    };
+    forkAiChatSession(session, fork_at_user_point);
+}
+
+fn forkAiChatSession(session: *ai_chat.Session, fork_at_user_point: ?usize) void {
+    const allocator = g_allocator orelse return;
+    // An ACP session's context lives in the external agent process; copying the
+    // local transcript would not fork that state, so refuse up front.
+    if (session.acp_command.len > 0) {
+        overlays.showStatusToast("ACP sessions cannot be forked");
+        markUiDirty();
+        return;
+    }
+    if (session.request_inflight) {
+        overlays.showStatusToast("Wait for the current reply to finish, then fork");
+        markUiDirty();
+        return;
+    }
+
+    var record = session.toHistoryRecord(allocator) catch |err| {
+        log.warn("failed to snapshot session for fork: {}", .{err});
+        overlays.showStatusToast("Fork failed");
+        markUiDirty();
+        return;
+    };
+    defer agent_history.freeOwnedRecord(allocator, &record);
+
+    if (fork_at_user_point) |user_point| {
+        conversation_fork.truncateRecordAtUserPoint(allocator, &record, user_point);
+    }
+
+    const now_ms = std.time.milliTimestamp();
+    const fork_id = conversation_fork.allocForkSessionId(allocator, record.session_id, now_ms, session_identity.next()) catch |err| {
+        log.warn("failed to build fork session id: {}", .{err});
+        overlays.showStatusToast("Fork failed");
+        markUiDirty();
+        return;
+    };
+    allocator.free(record.session_id);
+    record.session_id = fork_id;
+
+    const fork_title = conversation_fork.allocForkTitle(allocator, record.title) catch |err| {
+        log.warn("failed to build fork title: {}", .{err});
+        overlays.showStatusToast("Fork failed");
+        markUiDirty();
+        return;
+    };
+    allocator.free(record.title);
+    record.title = fork_title;
+
+    record.created_at = now_ms;
+    record.updated_at = now_ms;
+
+    const stored = blk: {
+        g_agent_history_mutex.lock();
+        defer g_agent_history_mutex.unlock();
+        const store = g_agent_history orelse break :blk false;
+        store.upsertRecord(record) catch |err| {
+            log.warn("failed to persist forked session {s}: {}", .{ record.session_id, err });
+            break :blk false;
+        };
+        markAgentHistoryDirtyLocked();
+        break :blk true;
+    };
+    if (!stored) {
+        overlays.showStatusToast("Fork failed");
+        markUiDirty();
+        return;
+    }
+
+    // Route by conversation shape: a sidebar conversation reopens in the
+    // sidebar, a tab conversation opens as a new AI chat tab. Both reopen paths
+    // reinstall the history-change hook, so future turns of the fork persist.
+    const opened = if (record.copilot) blk: {
+        loadCopilotConversationById(record.session_id);
+        break :blk true;
+    } else reopenAiChatTabFromHistorySessionId(record.session_id);
+    overlays.showStatusToast(if (opened) "Forked session" else "Fork failed");
+    markUiDirty();
+}
+
 pub fn currentTitlebarHeight() f32 {
     if (g_window) |w| return @floatFromInt(window_backend.titlebarHeight(w));
     return titlebar.titlebarHeight();
@@ -3729,7 +3904,7 @@ fn ensureActiveCopilotSession() ?*ai_chat.Session {
     return copilot_sidebar.ensureActiveSession(copilotSidebarHost());
 }
 
-fn ensureAiHistoryCopilotTarget() ?*ai_chat.Session {
+fn ensureCopilotContextTarget() ?*ai_chat.Session {
     if (activeAiChat()) |session| return session;
     if (activeCopilotSessionForInput()) |session| return session;
     const allocator = g_allocator orelse {
@@ -3974,6 +4149,164 @@ fn saveMarkdownDialogPathWithTitle(
 
 fn writeFilePath(path: []const u8, bytes: []const u8) !void {
     try platform_atomic_file.writeFileReplaceSafe(path, bytes);
+}
+
+// ============================================================================
+// Workspace recipes (named layouts)
+// ============================================================================
+
+/// Save the current window's full layout as a named workspace recipe under
+/// `<config-dir>/recipes/<name>.json`. Open AI chat tabs are flushed to the
+/// history store first so their ai_session_id references resolve on restore.
+pub fn saveWorkspaceRecipe(allocator: std.mem.Allocator, name: []const u8) bool {
+    persistOpenAiChatTabsToHistoryStore(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const session = tab.collectSessionSnapshot(&arena) catch |err| {
+        log.warn("saveWorkspaceRecipe: collect failed: {}", .{err});
+        overlays.showStatusToast(i18n.s().toast_recipe_save_failed);
+        return false;
+    };
+
+    const dir_path = platform_dirs.recipesDir(allocator) catch |err| {
+        log.warn("saveWorkspaceRecipe: recipesDir failed: {}", .{err});
+        overlays.showStatusToast(i18n.s().toast_recipe_save_failed);
+        return false;
+    };
+    defer allocator.free(dir_path);
+
+    recipe_store.saveRecipe(allocator, dir_path, name, &session) catch |err| {
+        log.warn("saveWorkspaceRecipe: save failed: {}", .{err});
+        overlays.showStatusToast(if (err == error.InvalidName)
+            i18n.s().toast_recipe_invalid_name
+        else
+            i18n.s().toast_recipe_save_failed);
+        return false;
+    };
+
+    var msg_buf: [recipe_store.NAME_MAX + 24]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Recipe '{s}' saved", .{name}) catch "Recipe saved";
+    overlays.showStatusToast(msg);
+    return true;
+}
+
+/// Restore the recipe file at `path` into a NEW window (recipes never load
+/// into the current window — the MAX_TABS truncation and active_tab semantics
+/// of mixing two layouts are not worth it).
+pub fn openRecipeInNewWindow(path: []const u8) void {
+    const app = g_app orelse return;
+    app.requestNewWindowWithRecipe(currentNativeHandle(), path);
+}
+
+/// Export the current window's layout snapshot to a user-chosen JSON file —
+/// the shareable "save as" counterpart of saveWorkspaceRecipe.
+pub fn exportCurrentWorkspaceRecipe(allocator: std.mem.Allocator) void {
+    persistOpenAiChatTabsToHistoryStore(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const session = tab.collectSessionSnapshot(&arena) catch |err| {
+        log.warn("exportCurrentWorkspaceRecipe: collect failed: {}", .{err});
+        overlays.showStatusToast(i18n.s().toast_recipe_save_failed);
+        return;
+    };
+    const json = session_persist.dumpSessionToString(allocator, session) catch |err| {
+        log.warn("exportCurrentWorkspaceRecipe: serialize failed: {}", .{err});
+        overlays.showStatusToast(i18n.s().toast_recipe_save_failed);
+        return;
+    };
+    defer allocator.free(json);
+
+    const initial_dir: ?[]const u8 = blk: {
+        if (platform_dirs.downloadsDir(allocator)) |dir| break :blk dir else |_| {}
+        if (platform_dirs.recipesDir(allocator)) |dir| break :blk dir else |_| {}
+        break :blk null;
+    };
+    defer if (initial_dir) |dir| allocator.free(dir);
+
+    const filters = [_]platform_file_dialog.Filter{
+        .{ .name = "WispTerm Recipe (*.json)", .pattern = "*.json" },
+        .{ .name = "All Files (*.*)", .pattern = "*.*" },
+    };
+    const owner: platform_file_dialog.Owner = if (g_window) |w|
+        platform_file_dialog.windowOwner(window_backend.nativeHandleBits(w))
+    else
+        .{};
+    const path = platform_file_dialog.saveFile(allocator, .{
+        .owner = owner,
+        .title = "Export Workspace Recipe",
+        .initial_dir = initial_dir,
+        .default_filename = "wispterm-recipe.json",
+        .default_extension = "json",
+        .filters = &filters,
+    }) orelse {
+        overlays.showStatusToast("Recipe export cancelled");
+        return;
+    };
+    defer allocator.free(path);
+
+    writeFilePath(path, json) catch |err| {
+        log.warn("failed to write recipe export {s}: {}", .{ path, err });
+        overlays.showStatusToast(i18n.s().toast_recipe_save_failed);
+        return;
+    };
+    if (input.copyTextToClipboard(path)) {
+        overlays.showStatusToast("Exported recipe; path copied");
+    } else {
+        overlays.showStatusToast("Exported recipe");
+    }
+}
+
+/// Import a recipe JSON file chosen by the user into the recipes directory,
+/// named after the file's stem. Conflicts and corrupt files are reported by
+/// toast; nothing is overwritten.
+pub fn importWorkspaceRecipeFromFile(allocator: std.mem.Allocator) void {
+    const filters = [_]platform_file_dialog.Filter{
+        .{ .name = "WispTerm Recipe (*.json)", .pattern = "*.json" },
+        .{ .name = "All Files (*.*)", .pattern = "*.*" },
+    };
+    const owner: platform_file_dialog.Owner = if (g_window) |w|
+        platform_file_dialog.windowOwner(window_backend.nativeHandleBits(w))
+    else
+        .{};
+    const path = platform_file_dialog.openFile(allocator, .{
+        .owner = owner,
+        .title = "Import Workspace Recipe",
+        .filters = &filters,
+    }) orelse {
+        overlays.showStatusToast("Recipe import cancelled");
+        return;
+    };
+    defer allocator.free(path);
+
+    const dir_path = platform_dirs.recipesDir(allocator) catch |err| {
+        log.warn("importWorkspaceRecipeFromFile: recipesDir failed: {}", .{err});
+        overlays.showStatusToast(i18n.s().toast_recipe_import_failed);
+        return;
+    };
+    defer allocator.free(dir_path);
+
+    const bytes = std.fs.cwd().readFileAlloc(allocator, path, recipe_store.MAX_RECIPE_BYTES) catch |err| {
+        log.warn("failed to read recipe import {s}: {}", .{ path, err });
+        overlays.showStatusToast(i18n.s().toast_recipe_import_failed);
+        return;
+    };
+    defer allocator.free(bytes);
+
+    const stored_name = recipe_store.importRecipeBytes(allocator, dir_path, std.fs.path.basename(path), bytes) catch |err| {
+        log.warn("failed to import recipe {s}: {}", .{ path, err });
+        overlays.showStatusToast(switch (err) {
+            error.NameTaken => i18n.s().toast_recipe_name_taken,
+            else => i18n.s().toast_recipe_import_failed,
+        });
+        return;
+    };
+    defer allocator.free(stored_name);
+
+    var msg_buf: [recipe_store.NAME_MAX + 24]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Imported recipe '{s}'", .{stored_name}) catch "Recipe imported";
+    overlays.showStatusToast(msg);
 }
 
 fn readLocalAiHistoryRaw(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -6326,6 +6659,7 @@ fn onPlatformMessage(msg: window_backend.MessageId, wParam: window_backend.WordP
         toggleQuakeVisibility();
         return 1;
     }
+    if (platform_notifications.handleCallback(msg, wParam, lParam)) return 1;
 
     const decoded = thread_message.decode(msg, lParam) orelse return null;
     const agent_host = agentRequestHost();
@@ -7081,6 +7415,9 @@ fn ensureNotifAuthRequested(native_toast: bool) void {
 /// Z-terminate title/body (truncating to the notification limits) and show a
 /// native toast. Caller has already routed via `notif_mod.decideRoute`.
 fn showToastZ(title: []const u8, body: []const u8) void {
+    if (g_window) |win| {
+        platform_notifications.bindWindow(window_backend.nativeHandle(win));
+    }
     var title_z: [notif_mod.max_title + 1]u8 = undefined;
     var body_z: [notif_mod.max_body + 1]u8 = undefined;
     const t = title[0..@min(title.len, notif_mod.max_title)];
@@ -7595,23 +7932,57 @@ fn runMainLoop(self: *AppWindow) !void {
             // window_backend above). Comptime-gated so non-D3D11 builds skip it.
             if (gpu.active == .d3d11) gpu.Context.setPresentInterval(0);
         } else {
+            // A staged recipe (named-workspace restore) takes priority over
+            // both the startup session restore and the default-tab plan: this
+            // window exists to host that recipe. Even a FAILED recipe restore
+            // suppresses the startup restore — the user asked for the recipe,
+            // not last session's tabs.
+            var recipe_ai_failed: usize = 0;
+            const recipe_staged = self.initial_recipe_path_len > 0;
+            const recipe_restored = if (recipe_staged) blk: {
+                const recipe_path = self.initial_recipe_path[0..self.initial_recipe_path_len];
+                self.initial_recipe_path_len = 0; // consume once
+                const result = tab.restoreSessionFromPath(
+                    allocator,
+                    recipe_path,
+                    term_cols,
+                    term_rows,
+                    g_cursor_style,
+                    g_cursor_blink,
+                );
+                recipe_ai_failed = result.ai_failed;
+                if (!result.any()) {
+                    overlays.showStatusToast(i18n.s().toast_recipe_restore_failed);
+                }
+                break :blk result.any();
+            } else false;
+
             // Try to restore the previous session, but only:
             //   - once per process (first window only),
             //   - if config.restore-tabs-on-startup is true,
-            //   - if no CWD override was provided (CLI/spawn).
+            //   - if no CWD override was provided (CLI/spawn),
+            //   - if no recipe was staged for this window.
             // TODO: also detect --command CLI override once a structured CLI
             // arg parser exists (today CLI args are merged into Config keys
             // and there is no positional/--command flag).
             const restore_once = !g_session_restore_attempted.swap(true, .seq_cst);
             const restore_enabled = if (g_app) |app| app.restore_tabs_on_startup else false;
-            const should_try_restore = restore_once and restore_enabled and initial_cwd == null;
-            const restored = should_try_restore and tab.restoreSessionFromFile(
+            const should_try_restore = restore_once and restore_enabled and initial_cwd == null and !recipe_staged;
+            const restored = recipe_restored or (should_try_restore and tab.restoreSessionFromFile(
                 allocator,
                 term_cols,
                 term_rows,
                 g_cursor_style,
                 g_cursor_blink,
-            );
+            ));
+
+            // Degradation summary: AI tabs whose persisted history session is
+            // gone (recipe shared to a machine without it) are skipped by
+            // restoreTab; surface one toast instead of silent gaps.
+            if (recipe_ai_failed > 0) {
+                std.debug.print("recipe: {d} AI tab(s) could not be restored\n", .{recipe_ai_failed});
+                overlays.showStatusToast(i18n.s().toast_recipe_ai_failed);
+            }
 
             switch (startup_tabs.initialTabPlan(.{
                 .restored_session = restored,
@@ -7846,15 +8217,22 @@ fn runMainLoop(self: *AppWindow) !void {
                     }
                 }
                 // In-app AI sessions: turn-end / needs-approval attention edges.
-                if (tb.ai_chat_session) |s| pollSessionAttention(s, tab_active);
-                if (tb.copilot_session) |s|
+                if (tb.ai_chat_session) |s| {
+                    pollSessionAttention(s, tab_active);
+                    // 空闲后按 FIFO 自动发送队列里的 prompt（chat tab 形态）。
+                    if (s.drainPromptQueue()) applyUiEffect(.repaint);
+                }
+                if (tb.copilot_session) |s| {
                     pollSessionAttention(s, tab_active and tb.copilot_visible);
+                    // 同上：copilot 侧栏会话形态。
+                    if (s.drainPromptQueue()) applyUiEffect(.repaint);
+                }
             }
         }
 
         // Update focus state
         const focused = window_backend.isFocused(win);
-        if (window_focused != focused) g_force_rebuild = true;
+        if (window_focused != focused) applyUiEffect(.{ .needs_rebuild = true });
         window_focused = focused;
 
         const fb = window_backend.framebufferSize(win);
@@ -8305,7 +8683,6 @@ fn runMainLoop(self: *AppWindow) !void {
 
     // Clean up file explorer async state (join background thread, free job)
     file_explorer.deinit();
-    memory_digest_scheduler.deinit();
     weixin_qr_renderer.deinit();
     weixin_qr_panel.deinit();
     feishu_reg_renderer.deinit();

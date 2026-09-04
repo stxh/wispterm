@@ -95,6 +95,10 @@ jobs:
             "plugins\skills\inspect-computer-config\SKILL.md",
             "plugins\skills\inspect-computer-config\scripts\inspect_computer_config.py"
           )
+          $replaceFiles = @(
+            "Replace-WispTerm.cmd",
+            "replace-install.ps1"
+          )
 
           if (!(Test-Path $portableExe)) {
             throw "Portable executable not found: $portableExe"
@@ -149,6 +153,12 @@ jobs:
               $path = Join-Path $distDir $skillFile
               if (!(Test-Path $path)) {
                 throw "Bundled skill file not found: $path"
+              }
+            }
+            foreach ($replaceFile in $replaceFiles) {
+              $path = Join-Path $distDir $replaceFile
+              if (!(Test-Path $path)) {
+                throw "Replace-install script not found: $path"
               }
             }
           }

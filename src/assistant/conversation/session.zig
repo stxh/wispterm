@@ -35,6 +35,8 @@ const ai_loop_schedule = @import("../loop/schedule.zig");
 const first_party_tools = @import("../../tools/first_party.zig");
 const terminal_lease = @import("../../agent/terminal_lease.zig");
 const session_identity = @import("identity.zig");
+const prompt_queue = @import("prompt_queue.zig");
+const session_queue = @import("session_queue.zig");
 
 pub const AgentSettings = ai_chat_types.AgentSettings;
 pub const AgentPermission = ai_chat_types.AgentPermission;
@@ -52,6 +54,8 @@ pub const AskResult = ai_chat_types.AskResult;
 const OwnedReplyContext = ai_chat_types.OwnedReplyContext;
 pub const ToolContext = ai_chat_types.ToolContext;
 pub const Presentation = assistant_presentation.Presentation;
+pub const PromptQueue = prompt_queue.PromptQueue;
+pub const MAX_QUEUED_PROMPTS = prompt_queue.MAX_ENTRIES;
 
 pub const DEFAULT_NAME = "DeepSeek";
 pub const DEFAULT_BASE_URL = "https://api.deepseek.com";
@@ -419,6 +423,7 @@ const DeferredAction = union(enum) {
     btw_overlay,
     export_markdown: MarkdownExportMode,
     copy_transcript: MarkdownExportMode,
+    fork_at_rewind: usize,
 };
 
 /// Result of running a built-in command under the lock: the (optional) history
@@ -446,6 +451,9 @@ fn fireDeferredAction(session: *Session, action: DeferredAction) void {
         .export_markdown => |mode| if (g_ui_triggers.export_markdown) |t| t(session, mode),
         // Targets the session that submitted `/copy` (copilot sidebar OR a tab).
         .copy_transcript => |mode| if (g_ui_triggers.copy) |t| t(session, mode),
+        // rewind 选择器 `f`：payload 是 record 内 0-based user 消息序号（截断
+        // 点），由 requestForkAtRewindSelection 锁内换算好。
+        .fork_at_rewind => |user_point| if (g_ui_triggers.fork_at_rewind) |t| t(session, user_point),
     }
 }
 
@@ -462,6 +470,7 @@ const UiTriggers = struct {
     btw_overlay: ?*const fn (*Session) void = null,
     export_markdown: ?*const fn (*Session, MarkdownExportMode) void = null,
     copy: ?*const fn (*Session, MarkdownExportMode) void = null,
+    fork_at_rewind: ?*const fn (*Session, usize) void = null,
 };
 var g_ui_triggers: UiTriggers = .{};
 threadlocal var g_dynamic_tool_specs: []ai_chat_protocol.DynamicToolSpec = &.{};
@@ -544,6 +553,14 @@ pub fn setMarkdownExportTrigger(cb: ?*const fn (*Session, MarkdownExportMode) vo
 /// the copy reads the session under the SAME mutex (`allocMarkdownExport`).
 pub fn setTranscriptCopyTrigger(cb: ?*const fn (*Session, MarkdownExportMode) void) void {
     g_ui_triggers.copy = cb;
+}
+
+/// Wire the callback that the rewind picker's `f` key fires to fork the session
+/// before the selected user message. Fired AFTER the session mutex unlocks; the
+/// payload is the 0-based user-message ordinal inside the persisted record (the
+/// truncation point), already mapped by `requestForkAtRewindSelection`.
+pub fn setForkAtRewindTrigger(cb: ?*const fn (*Session, usize) void) void {
+    g_ui_triggers.fork_at_rewind = cb;
 }
 threadlocal var g_tool_host: ?ToolHost = null;
 
@@ -1078,6 +1095,14 @@ pub const Session = struct {
     vision_enabled: bool = false,
     // base64 images pasted into the composer, awaiting the next user message.
     pending_images: std.ArrayListUnmanaged(ai_chat_protocol.ImageBlock) = .empty,
+    // busy（request_inflight）时提交的 prompt 进入这个内存队列，回到空闲后由
+    // drainPromptQueue（仅主循环 tick 调用）按 FIFO 自动发送。不持久化，
+    // 上限 prompt_queue.MAX_ENTRIES 条，重启即清空。
+    // 默认空壳仅供结构体字面量测试（Session{ .allocator = a }）编译；
+    // 正常初始化走 Session.init 的 PromptQueue.init(allocator)。
+    prompt_queue: PromptQueue = .{},
+    queue_open: bool = false,
+    queue_selected: usize = 0,
     created_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
     history_on_change: ?HistoryChangeHook = null,
@@ -1313,6 +1338,7 @@ pub const Session = struct {
         const session = try allocator.create(Session);
         session.* = .{
             .allocator = allocator,
+            .prompt_queue = PromptQueue.init(allocator),
         };
         session.assignSessionId();
         session.created_at_ms = std.time.milliTimestamp();
@@ -1439,6 +1465,7 @@ pub const Session = struct {
         }
         self.messages.deinit(self.allocator);
         self.clearPendingImages();
+        self.prompt_queue.deinit();
         self.freeSkillSuggestions();
         self.freeCustomCommandSuggestions();
         command_registry.freeCommandList(self.allocator, self.custom_commands);
@@ -1867,6 +1894,14 @@ pub const Session = struct {
     }
 
     pub fn handleChar(self: *Session, codepoint: u21) void {
+        // rewind 选择器的 `f` = 分叉到选中 user 消息之前。普通可打印字符只以
+        // CharEvent 到达这里（input/key.zig 的 Key 枚举没有 key_f，input.zig
+        // 的 isAiChatKey 也不放行字母键），所以截获必须在 handleChar 而不是
+        // handleKeyWithWrapCols 的 rewind_open 按键分支里。
+        if (self.rewind_open and (codepoint == 'f' or codepoint == 'F')) {
+            self.requestForkAtRewindSelection();
+            return;
+        }
         if (codepoint == 'y' or codepoint == 'Y') {
             if (self.resolveApproval(true)) return;
         }
@@ -1981,15 +2016,19 @@ pub const Session = struct {
         if (text_start < data.len) self.appendInputText(data[text_start..]);
     }
 
-    /// Inject a scheduled prompt as if the user typed + submitted it. Returns
-    /// false (skipped, nothing sent) if a request is already inflight. Clears any
-    /// half-typed composer text first so the scheduled prompt is sent verbatim.
+    /// Inject a scheduled prompt as if the user typed + submitted it. When a
+    /// request is already inflight the prompt joins the in-memory prompt queue
+    /// (with any pending reply context) instead of being dropped, and is sent
+    /// by drainPromptQueue once the session goes idle; returns false only when
+    /// the queue is full. Clears any half-typed composer text first so the
+    /// scheduled prompt is sent verbatim.
     /// Caller must run this on the UI thread (mirrors applyRemoteInput).
     pub fn submitScheduledPrompt(self: *Session, text: []const u8) bool {
         self.mutex.lock();
         if (self.request_inflight) {
+            const accepted = session_queue.enqueueQueuedPromptLocked(self, text, false, null);
             self.mutex.unlock();
-            return false;
+            return accepted;
         }
         self.composer.clear();
         self.input_scroll_row = 0;
@@ -2004,21 +2043,26 @@ pub const Session = struct {
     /// WeChat delivers complete messages, not keystrokes: the whole payload is
     /// one prompt (embedded newlines are content, unlike applyRemoteInput where
     /// each one submits); only the trailing CR/LF byte-stream submit convention
-    /// is stripped. Returns false (busy) without touching the composer when a
-    /// request is already inflight, so the poller reports it to the sender
-    /// instead of silently swallowing the message.
+    /// is stripped. When a request is already inflight the message joins the
+    /// prompt queue together with its own reply context (the single-slot
+    /// pending_reply_context cannot hold per-message contexts, so each queued
+    /// entry carries its own); returns false only when the queue is full, so
+    /// the poller reports it to the sender instead of silently swallowing the
+    /// message.
     pub fn applyChatInput(self: *Session, data: []const u8, ctx: chatops_reply.ReplyContext) bool {
         self.mutex.lock();
         if (self.request_inflight) {
+            const accepted = session_queue.enqueueQueuedPromptLocked(self, std.mem.trimRight(u8, data, "\r\n"), false, ctx);
             self.mutex.unlock();
-            return false;
+            return accepted;
         }
         if (self.pending_reply_context) |*old| old.deinit(self.allocator);
         self.pending_reply_context = OwnedReplyContext.init(self.allocator, ctx) catch null;
         self.mutex.unlock();
         if (self.submitScheduledPrompt(std.mem.trimRight(u8, data, "\r\n"))) return true;
-        // Lost the race with a concurrently started request: drop the stale
-        // context so a later local prompt cannot inherit this WeChat target.
+        // Lost the race with a concurrently started request and the queue was
+        // full: drop the stale context so a later local prompt cannot inherit
+        // this WeChat target.
         self.mutex.lock();
         self.clearPendingReplyContextLocked();
         self.mutex.unlock();
@@ -2045,6 +2089,14 @@ pub const Session = struct {
                 else => self.closeRewindPicker(), // Esc 及其它键一律关闭
             }
             return;
+        }
+
+        if (self.queue_open) {
+            // 队列面板打开时优先截获按键（仿 rewind 选择器）：↑↓ 选择、
+            // Alt+↑/↓ 重排、Delete/Backspace 删除、Enter 取回 composer 编辑、
+            // Esc 关闭。空面板或 composer 已有新文本时 Enter 不吞掉，落到
+            // 下面的 submit 路径（busy 时再次入队）。
+            if (session_queue.handlePanelKey(self, ev)) return;
         }
 
         if (ev.ctrl and !ev.alt and ev.key == .key_a) {
@@ -2736,7 +2788,18 @@ pub const Session = struct {
         }
         if (self.request_thread) |thread| {
             if (self.request_inflight) {
-                self.clearPendingReplyContextLocked();
+                // Busy: queue the prompt instead of dropping it. Pending images
+                // move into the entry so the next normal submit cannot steal
+                // them; the reply context (if any) travels with the entry. On a
+                // full queue keep the original reject behavior (prompt stays in
+                // the composer, context is cleared).
+                const queued_text = std.mem.trim(u8, self.input(), " \t\r\n");
+                if (queued_text.len != 0 and session_queue.enqueueQueuedPromptLocked(self, queued_text, true, null)) {
+                    self.clearSubmittedInputLocked();
+                    self.queue_open = true;
+                } else {
+                    self.clearPendingReplyContextLocked();
+                }
                 self.mutex.unlock();
                 return;
             }
@@ -3915,7 +3978,7 @@ pub const Session = struct {
     }
 
     /// 用 text 覆盖输入框内容，光标置于末尾。纯缓冲区操作、无 IO。
-    fn setInputTextLocked(self: *Session, text: []const u8) void {
+    pub fn setInputTextLocked(self: *Session, text: []const u8) void {
         self.clearComposerHistoryNavigationLocked();
         self.replaceInputTextLocked(text);
     }
@@ -4046,11 +4109,46 @@ pub const Session = struct {
         self.notifyHistoryChange(history_change);
     }
 
+    /// rewind 选择器里的 `f`：请求把会话分叉到选中 user 消息之前（原会话不
+    /// 动）。仅空闲且选择器打开时有效；锁内把选中项换算成 record 内的
+    /// 0-based user 消息序号（record 只含 persist_to_history 的消息），锁外
+    /// 通过 deferred action 交给 AppWindow 执行实际分叉。
+    pub fn requestForkAtRewindSelection(self: *Session) void {
+        var user_point: usize = 0;
+        self.mutex.lock();
+        if (self.request_inflight or !self.rewind_open) {
+            self.mutex.unlock();
+            return;
+        }
+        const count = self.rewindPointCountLocked();
+        if (count == 0) {
+            self.rewind_open = false;
+            self.mutex.unlock();
+            return;
+        }
+        const sel = @min(self.rewind_selected, count - 1);
+        const idx = self.rewindPointMessageIndexLocked(sel);
+        for (self.messages.items[0..@min(idx, self.messages.items.len)]) |msg| {
+            if (msg.role == .user and msg.persist_to_history) user_point += 1;
+        }
+        self.rewind_open = false;
+        self.mutex.unlock();
+        fireDeferredAction(self, .{ .fork_at_rewind = user_point });
+    }
+
     fn rollbackMessagesFromLocked(self: *Session, start: usize) void {
         while (self.messages.items.len > start) {
             if (self.messages.pop()) |m| m.deinit(self.allocator) else break;
         }
     }
+
+    // Prompt-queue 实现拆到 session_queue.zig（file_size_guard 回逼出的责任
+    // 拆分）：入队钩子、FIFO drain、面板选择/重排/删除/取回都在那边；这里只
+    // 留方法语法入口。Locked 系列假定 mutex 已持有，由本文件的按键/提交路径
+    // 持锁调用。
+    pub const drainPromptQueue = session_queue.drainPromptQueue;
+    pub const togglePromptQueuePanel = session_queue.togglePromptQueuePanel;
+    pub const clearPromptQueue = session_queue.clearPromptQueue;
 
     /// 对话中 role == .user 的消息条数（回溯点数量）。持锁内部版本。
     fn rewindPointCountLocked(self: *Session) usize {
@@ -4770,7 +4868,7 @@ pub const Session = struct {
         self.setStatusLocked(text);
     }
 
-    fn setStatusLocked(self: *Session, value: []const u8) void {
+    pub fn setStatusLocked(self: *Session, value: []const u8) void {
         self.status_len = @min(value.len, self.status_buf.len);
         @memcpy(self.status_buf[0..self.status_len], value[0..self.status_len]);
     }
@@ -5891,11 +5989,13 @@ const TestHistoryHookCapture = struct {
     }
 };
 
-var g_test_history_hook_capture: ?*TestHistoryHookCapture = null;
+const TestHistoryHookState = struct {
+    var capture: ?*TestHistoryHookCapture = null;
+};
 
 fn testHistoryHookCaptureCallback(event: HistoryChangeEvent) void {
     var owned = event;
-    const capture = g_test_history_hook_capture orelse {
+    const capture = TestHistoryHookState.capture orelse {
         owned.deinit();
         return;
     };
@@ -6806,8 +6906,8 @@ test "ai_chat: progress tool messages are ui-only history" {
 
     var capture = TestHistoryHookCapture{};
     defer capture.deinit();
-    g_test_history_hook_capture = &capture;
-    defer g_test_history_hook_capture = null;
+    TestHistoryHookState.capture = &capture;
+    defer TestHistoryHookState.capture = null;
 
     session.setHistoryChangeHook(testHistoryHookCaptureCallback);
     try appendProgressMessage(session, "running tool");
@@ -6843,8 +6943,8 @@ test "ai_chat: replayable skill tool messages emit history snapshots" {
 
     var capture = TestHistoryHookCapture{};
     defer capture.deinit();
-    g_test_history_hook_capture = &capture;
-    defer g_test_history_hook_capture = null;
+    TestHistoryHookState.capture = &capture;
+    defer TestHistoryHookState.capture = null;
 
     session.setHistoryChangeHook(testHistoryHookCaptureCallback);
     try appendReplayableToolMessage(session, "call-1", "skill_info", "# Skill: pdf");
@@ -6881,8 +6981,8 @@ test "ai_chat: model switch checkpoint emits separate resumable history record" 
 
     var capture = TestHistoryHookCapture{};
     defer capture.deinit();
-    g_test_history_hook_capture = &capture;
-    defer g_test_history_hook_capture = null;
+    TestHistoryHookState.capture = &capture;
+    defer TestHistoryHookState.capture = null;
     session.setHistoryChangeHook(testHistoryHookCaptureCallback);
 
     session.mutex.lock();
@@ -6924,8 +7024,8 @@ test "ai_chat: setTitle emits history hook snapshot" {
 
     var capture = TestHistoryHookCapture{};
     defer capture.deinit();
-    g_test_history_hook_capture = &capture;
-    defer g_test_history_hook_capture = null;
+    TestHistoryHookState.capture = &capture;
+    defer TestHistoryHookState.capture = null;
 
     session.setHistoryChangeHook(testHistoryHookCaptureCallback);
     session.setTitle("After");
@@ -9271,22 +9371,6 @@ test "setDefaultWorkingDir is reflected in currentAgentSettings" {
     try std.testing.expect(currentAgentSettings().working_dir == null);
 }
 
-test "submitScheduledPrompt sets composer and reports busy state" {
-    const a = std.testing.allocator;
-    const session = try Session.init(a, "test", "", "", "", "", "", "", "", "");
-    defer session.deinit();
-
-    // Not inflight: returns true and submit is invoked (no agent configured, no-ops).
-    const ok = session.submitScheduledPrompt("hello world");
-    try std.testing.expect(ok);
-
-    // Inflight: returns false (skip).
-    session.request_inflight = true;
-    const skipped = session.submitScheduledPrompt("again");
-    try std.testing.expect(!skipped);
-    session.request_inflight = false;
-}
-
 test "applyChatInput submits the whole multi-line message as one prompt" {
     const a = std.testing.allocator;
     const session = try Session.init(a, "test", "", "", "", "", "", "", "", "");
@@ -9305,26 +9389,6 @@ test "applyChatInput submits the whole multi-line message as one prompt" {
     // composer, so the composer shows exactly what the single submit sent.
     try std.testing.expect(session.applyChatInput("第一段\n\n第二段\r", ctx));
     try std.testing.expectEqualStrings("第一段\n\n第二段", session.input());
-}
-
-test "applyChatInput reports busy and leaves composer and reply context untouched" {
-    const a = std.testing.allocator;
-    const session = try Session.init(a, "test", "", "", "", "", "", "", "", "");
-    defer session.deinit();
-
-    var capture = WeixinAttachmentCapture{};
-    const ctx = chatops_reply.ReplyContext{
-        .sender = testWeixinSender(&capture),
-        .to_user_id = "wx-user",
-        .context_token = "ctx-1",
-    };
-
-    session.appendInputText("draft");
-    session.request_inflight = true;
-    try std.testing.expect(!session.applyChatInput("新任务\r", ctx));
-    session.request_inflight = false;
-    try std.testing.expectEqualStrings("draft", session.input());
-    try std.testing.expect(session.pending_reply_context == null);
 }
 
 test "runLoopCommandLocked creates, lists, and stops a loop task" {
@@ -9523,8 +9587,8 @@ test "ai chat appendContextCard stores collapsed persisted user context" {
 
     var capture = TestHistoryHookCapture{};
     defer capture.deinit();
-    g_test_history_hook_capture = &capture;
-    defer g_test_history_hook_capture = null;
+    TestHistoryHookState.capture = &capture;
+    defer TestHistoryHookState.capture = null;
     session.setHistoryChangeHook(testHistoryHookCaptureCallback);
 
     try session.appendContextCard("AI History: Codex sess-1", "## User\n\nstatus?", true);

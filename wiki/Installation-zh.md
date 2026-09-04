@@ -11,7 +11,10 @@ WispTerm 提供 **Windows** 与 **macOS** 版本。**Linux** x86_64 AppImage 也
 
 1. 从 [GitHub Releases](https://github.com/xuzhougeng/wispterm/releases) 下载最新
    Windows 版本。
-2. 解压后运行 **`wispterm.exe`**。
+2. 把整个压缩包解压到一个文件夹。
+3. 运行 **`wispterm.exe`**，或双击 **`Replace-WispTerm.cmd`**：脚本会按开始菜单
+   快捷方式覆盖现有安装；如果还没有快捷方式，则安装到
+   `%LOCALAPPDATA%\Programs\WispTerm` 并创建开始菜单项。
 
 WispTerm 不会自行提权 —— 普通方式启动得到的是标准权限令牌。需要管理员 shell 时，
 右键 `wispterm.exe` 选择 **以管理员身份运行**（见 [[常见问题|FAQ-zh]]）。
@@ -82,6 +85,8 @@ wispterm --show-config-path   # 打印解析出的配置文件路径
 - **Check for Updates** —— 立即检查是否有新版本。
 - **Download Update** —— 把最新版本下载到 Downloads 文件夹。
 - **Open Latest Release** —— 在浏览器中打开发布页。
+
+在 Windows 上，解压后双击 **`Replace-WispTerm.cmd`** 即可覆盖开始菜单里的现有安装。
 
 升级后，**What's New**（命令中心里，也会在首次启动新版本时自动弹出）会汇总改动。
 **Skill Center（技能中心）** 可以盘点、安装并跨服务器同步技能，也能从 GitHub 仓库安装最新技能。

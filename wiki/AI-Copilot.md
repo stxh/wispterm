@@ -280,12 +280,13 @@ use Up/Down to move, `Enter` to reopen, `Delete` to remove the selected saved
 conversation, and `Esc` to return to the normal command center.
 
 Open the session launcher (`Ctrl+Shift+T`) and choose **Sessions** to browse
-Codex, Claude Code, and Reasonix transcripts on a Local, WSL, or SSH target.
+Codex, Claude Code, and Kimi Code transcripts on a Local, WSL, or SSH target.
 WispTerm connects to the target, scans `$HOME/.codex`, `$HOME/.claude`, and
-`$HOME/.reasonix` for metadata, and loads a transcript only when you open its
-row. **Resume** opens a real terminal tab on the same target in the original
-project directory recorded in the history file; if that directory is missing,
-resume stops instead of falling back to `$HOME`.
+`$HOME/.kimi-code/sessions` for metadata, and loads a transcript only when you
+open its row. Kimi Code metadata also uses `state.json` and the global
+`$HOME/.kimi-code/session_index.jsonl`. **Resume** opens a real terminal tab on
+the same target in the original project directory recorded in the history file;
+if that directory is missing, resume stops instead of falling back to `$HOME`.
 
 ## Slash commands
 

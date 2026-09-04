@@ -52,10 +52,18 @@ pub const Session = struct {
 
     const PaneState = struct {
         pane_id: usize,
+        pending: bool = false,
         alternate_on: bool = false,
-        cursor_visible: ?bool = null,
-        cursor_x: ?usize = null,
-        cursor_y: ?usize = null,
+        alternate_saved_x: ?usize = null,
+        alternate_saved_y: ?usize = null,
+        /// VT controls that reconcile the fresh/reused Surface with tmux's
+        /// pane modes. Applied only after the active screen capture is seeded,
+        /// otherwise a restored scroll region can corrupt the seed itself.
+        restore: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn deinit(self: *PaneState, alloc: Allocator) void {
+            self.restore.deinit(alloc);
+        }
     };
 
     const CaptureRequest = struct {
@@ -63,14 +71,16 @@ pub const Session = struct {
         screen: CaptureScreen,
     };
 
-    const PaneListRequest = struct {
-        restore_cursor_after_metadata: bool = false,
+    const PaneStateRequest = struct {
+        capture: bool = false,
+        pane_id: ?usize = null,
     };
 
     const ReplyKind = union(enum) {
         ignore,
         window_list,
-        pane_list: PaneListRequest,
+        pane_list,
+        pane_state: PaneStateRequest,
         capture: CaptureRequest,
     };
 
@@ -100,14 +110,14 @@ pub const Session = struct {
         onWindowClose: *const fn (ctx: *anyopaque, window_id: usize) void = noClose,
         onActiveWindowChanged: *const fn (ctx: *anyopaque, window_id: usize) void = noActiveWindow,
         onActivePaneChanged: *const fn (ctx: *anyopaque, pane_id: usize) void = noActive,
-        onPaneMeta: *const fn (ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8, alternate_on: bool) void = noPaneMeta,
+        onPaneMeta: *const fn (ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8) void = noPaneMeta,
 
         fn noLayout(_: *anyopaque, _: usize, _: *const layout.Node) void {}
         fn noRename(_: *anyopaque, _: usize, _: []const u8) void {}
         fn noClose(_: *anyopaque, _: usize) void {}
         fn noActiveWindow(_: *anyopaque, _: usize) void {}
         fn noActive(_: *anyopaque, _: usize) void {}
-        fn noPaneMeta(_: *anyopaque, _: usize, _: []const u8, _: []const u8, _: bool) void {}
+        fn noPaneMeta(_: *anyopaque, _: usize, _: []const u8, _: []const u8) void {}
     };
 
     pub fn init(alloc: Allocator, sink: PaneSink, cols: u16, rows: u16) Session {
@@ -125,6 +135,7 @@ pub const Session = struct {
         self.cmds.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.reply_queue.deinit(self.alloc);
+        self.clearPaneStates();
         self.pane_states.deinit(self.alloc);
         for (self.windows.items) |*w| w.deinit(self.alloc);
         self.windows.deinit(self.alloc);
@@ -152,6 +163,9 @@ pub const Session = struct {
         self.parser = control.Parser.init(self.alloc);
         self.cmds.clearRetainingCapacity();
         self.reply_queue.clearRetainingCapacity();
+        // The reused Surfaces must be reconciled from the newly attached tmux
+        // client, not from terminal modes cached before the transport dropped.
+        self.clearPaneStates();
         self.exited = false;
         self.session_gone = false;
     }
@@ -183,7 +197,7 @@ pub const Session = struct {
                 if (isSessionGoneError(body)) self.session_gone = true;
                 // Pop the matching command reply, but do not let non-capture
                 // errors consume any later capture seed.
-                _ = self.popReply();
+                if (self.popReply()) |reply| self.finishFailedReply(reply);
             },
             .window_add => |w| _ = try self.ensureWindow(w.window_id),
             .window_renamed => |w| {
@@ -264,17 +278,14 @@ pub const Session = struct {
         return false;
     }
 
-    fn takeFirstPaneListReply(self: *Session) ?PaneListRequest {
+    fn takeFirstPaneListReply(self: *Session) bool {
         for (self.reply_queue.items, 0..) |reply, i| {
-            switch (reply) {
-                .pane_list => |req| {
-                    _ = self.reply_queue.orderedRemove(i);
-                    return req;
-                },
-                else => {},
+            if (std.meta.activeTag(reply) == .pane_list) {
+                _ = self.reply_queue.orderedRemove(i);
+                return true;
             }
         }
-        return null;
+        return false;
     }
 
     fn handleBlockEnd(self: *Session, body: []const u8) Allocator.Error!void {
@@ -285,6 +296,10 @@ pub const Session = struct {
             if (self.reply_queue.items.len > 0) {
                 switch (self.reply_queue.items[0]) {
                     .ignore, .window_list, .pane_list => _ = self.popReply(),
+                    .pane_state => {
+                        const reply = self.popReply().?;
+                        self.finishFailedReply(reply);
+                    },
                     .capture => |cap| {
                         _ = self.popReply();
                         try self.seedCapturePane(cap.pane_id, cap.screen, body);
@@ -296,8 +311,8 @@ pub const Session = struct {
 
         if (isPaneListReply(body)) {
             self.dropLeadingIgnoredReplies();
-            const req: PaneListRequest = self.takeFirstPaneListReply() orelse .{};
-            _ = try self.applyPaneList(body, req.restore_cursor_after_metadata);
+            _ = self.takeFirstPaneListReply();
+            _ = try self.applyPaneList(body);
             return;
         }
 
@@ -312,20 +327,30 @@ pub const Session = struct {
             switch (reply) {
                 .ignore => {},
                 .window_list => _ = try self.applyWindowList(body),
-                .pane_list => |req| _ = try self.applyPaneList(body, req.restore_cursor_after_metadata),
+                .pane_list => _ = try self.applyPaneList(body),
+                .pane_state => |req| _ = try self.applyPaneState(body, req),
                 .capture => |cap| try self.seedCapturePane(cap.pane_id, cap.screen, body),
             }
             return;
         }
 
         if (!try self.applyWindowList(body)) {
-            if (isPaneListReply(body)) _ = try self.applyPaneList(body, false);
+            if (isPaneListReply(body)) _ = try self.applyPaneList(body);
+        }
+    }
+
+    fn finishFailedReply(self: *Session, reply: ReplyKind) void {
+        switch (reply) {
+            .pane_state => |req| {
+                if (req.pane_id) |pane_id| self.removePendingPaneState(pane_id);
+            },
+            else => {},
         }
     }
 
     fn seedCapturePane(self: *Session, pane_id: usize, screen: CaptureScreen, body: []const u8) Allocator.Error!void {
         if (isPaneListReply(body)) {
-            _ = try self.applyPaneList(body, false);
+            _ = try self.applyPaneList(body);
             return;
         }
         if (isWindowListReply(body)) {
@@ -338,7 +363,10 @@ pub const Session = struct {
         // without returning to column 0 — without the '\r' each row staircases.
         self.scratch.clearRetainingCapacity();
         try self.scratch.appendSlice(self.alloc, if (screen == .alternate) "\x1b[?1049h" else "\x1b[?1049l");
-        try self.scratch.appendSlice(self.alloc, "\x1b[2J\x1b[H");
+        // capture-pane -e describes cell attributes, not the pane's current
+        // rendition. Reset before clearing and again after the final cell so a
+        // captured background cannot leak into later live output.
+        try self.scratch.appendSlice(self.alloc, "\x1b[0m\x1b[2J\x1b[H");
         for (body) |c| {
             if (c == '\n') {
                 try self.scratch.appendSlice(self.alloc, "\r\n");
@@ -346,7 +374,8 @@ pub const Session = struct {
                 try self.scratch.append(self.alloc, c);
             }
         }
-        try self.appendPaneCursorRestore(pane_id, screen, &self.scratch);
+        try self.scratch.appendSlice(self.alloc, "\x1b[0m");
+        try self.appendPaneStateRestore(pane_id, screen, &self.scratch);
         self.sink.write(pane_id, self.scratch.items);
     }
 
@@ -398,65 +427,28 @@ pub const Session = struct {
         return applied;
     }
 
-    /// Parse a `list-panes -s -F "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{alternate_on}\t#{cursor_flag}\t#{cursor_x}\t#{cursor_y}"`
-    /// reply body. Each line:
-    /// `%<id>\t<path>\t<cmd>\t<alternate_on>\t<cursor_flag>\t<cursor_x>\t<cursor_y>`.
-    /// Older three-field fixtures are accepted with `alternate_on=false`.
-    /// Emits onPaneMeta per line.
+    /// Parse the cwd/current-command metadata query and emit onPaneMeta per
+    /// line. Terminal state is intentionally queried separately with a safe
+    /// semicolon delimiter: paths may contain spaces, while state has many
+    /// optional fields whose empty values must not collapse.
     /// Returns true if at least one line applied. The caller (block_end) gates
     /// this via `isPaneListReply` so it is only reached when the body is
     /// unambiguously a pane-list; per-line parsing is lenient (skips malformed).
-    fn applyPaneList(self: *Session, body: []const u8, restore_cursor_after_metadata: bool) Allocator.Error!bool {
+    fn applyPaneList(self: *Session, body: []const u8) Allocator.Error!bool {
         var applied = false;
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw| {
             const parsed = parsePaneListLine(raw) orelse continue;
-            try self.setPaneState(parsed.id, parsed.state);
-            self.events.onPaneMeta(self.events.ctx, parsed.id, parsed.path, parsed.cmd, parsed.state.alternate_on);
-            if (restore_cursor_after_metadata) try self.writePaneCursorRestore(parsed.id);
+            self.events.onPaneMeta(self.events.ctx, parsed.id, parsed.path, parsed.cmd);
             applied = true;
         }
         return applied;
-    }
-
-    fn parsePaneStateFields(
-        alternate_on: []const u8,
-        cursor_flag: ?[]const u8,
-        cursor_x: ?[]const u8,
-        cursor_y: ?[]const u8,
-    ) PaneState {
-        var state: PaneState = .{ .pane_id = 0 };
-        state.alternate_on = std.mem.eql(u8, std.mem.trim(u8, alternate_on, " \r\t"), "1");
-        if (cursor_flag) |field| {
-            const trimmed = std.mem.trim(u8, field, " \r\t");
-            if (std.mem.eql(u8, trimmed, "0")) {
-                state.cursor_visible = false;
-            } else if (std.mem.eql(u8, trimmed, "1")) {
-                state.cursor_visible = true;
-            }
-        }
-        if (cursor_x) |field| {
-            const trimmed = std.mem.trim(u8, field, " \r\t");
-            if (trimmed.len > 0) state.cursor_x = std.fmt.parseInt(usize, trimmed, 10) catch null;
-        }
-        if (cursor_y) |field| {
-            const trimmed = std.mem.trim(u8, field, " \r\t");
-            if (trimmed.len > 0) state.cursor_y = std.fmt.parseInt(usize, trimmed, 10) catch null;
-        }
-        return state;
-    }
-
-    fn parsePaneStateTail(tail: []const u8) PaneState {
-        var fields = std.mem.splitScalar(u8, tail, '\t');
-        const alternate_on = fields.next() orelse return .{ .pane_id = 0 };
-        return parsePaneStateFields(alternate_on, fields.next(), fields.next(), fields.next());
     }
 
     const PaneListLine = struct {
         id: usize,
         path: []const u8,
         cmd: []const u8,
-        state: PaneState,
     };
 
     fn parsePaneListLine(raw: []const u8) ?PaneListLine {
@@ -480,7 +472,6 @@ pub const Session = struct {
             .id = id,
             .path = path,
             .cmd = if (t3) |idx| cmd_and_state[0..idx] else cmd_and_state,
-            .state = parsePaneStateTail(if (t3) |idx| cmd_and_state[idx + 1 ..] else ""),
         };
     }
 
@@ -506,11 +497,7 @@ pub const Session = struct {
         const id = std.fmt.parseInt(usize, line[1..id_end], 10) catch return null;
 
         const rest = std.mem.trimLeft(u8, line[id_end..], " \r\t");
-        const y = lastTokenBefore(rest, rest.len) orelse return null;
-        const x = lastTokenBefore(rest, y.start) orelse return null;
-        const cursor = lastTokenBefore(rest, x.start) orelse return null;
-        const alternate = lastTokenBefore(rest, cursor.start) orelse return null;
-        const cmd = lastTokenBefore(rest, alternate.start) orelse return null;
+        const cmd = lastTokenBefore(rest, rest.len) orelse return null;
         const path = std.mem.trim(u8, rest[0..cmd.start], " \r\t");
         if (path.len == 0) return null;
 
@@ -518,25 +505,223 @@ pub const Session = struct {
             .id = id,
             .path = path,
             .cmd = rest[cmd.start..cmd.end],
-            .state = parsePaneStateFields(
-                rest[alternate.start..alternate.end],
-                rest[cursor.start..cursor.end],
-                rest[x.start..x.end],
-                rest[y.start..y.end],
-            ),
         };
     }
 
-    fn setPaneState(self: *Session, pane_id: usize, state: PaneState) Allocator.Error!void {
-        const stored = PaneState{
+    const CursorShape = enum { default, block, underline, bar };
+
+    const ParsedPaneState = struct {
+        pane_id: usize,
+        cursor_x: ?usize,
+        cursor_y: ?usize,
+        cursor_visible: ?bool,
+        cursor_shape: ?CursorShape,
+        cursor_blinking: ?bool,
+        alternate_on: bool,
+        alternate_saved_x: ?usize,
+        alternate_saved_y: ?usize,
+        insert: ?bool,
+        wrap: ?bool,
+        keypad: ?bool,
+        cursor_keys: ?bool,
+        origin: ?bool,
+        mouse_all: ?bool,
+        mouse_button: ?bool,
+        mouse_standard: ?bool,
+        mouse_utf8: ?bool,
+        mouse_sgr: ?bool,
+        focus: ?bool,
+        bracketed_paste: ?bool,
+        scroll_top: ?usize,
+        scroll_bottom: ?usize,
+        pane_tabs: ?[]const u8,
+    };
+
+    fn parseOptionalBool(field: ?[]const u8) ?bool {
+        const value = std.mem.trim(u8, field orelse return null, " \r\t");
+        if (std.mem.eql(u8, value, "1")) return true;
+        if (std.mem.eql(u8, value, "0")) return false;
+        return null;
+    }
+
+    fn parseOptionalInt(field: ?[]const u8) ?usize {
+        const value = std.mem.trim(u8, field orelse return null, " \r\t");
+        if (value.len == 0) return null;
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+
+    fn parseCursorShape(field: ?[]const u8) ?CursorShape {
+        const value = std.mem.trim(u8, field orelse return null, " \r\t");
+        if (std.mem.eql(u8, value, "default")) return .default;
+        if (std.mem.eql(u8, value, "block")) return .block;
+        if (std.mem.eql(u8, value, "underline")) return .underline;
+        if (std.mem.eql(u8, value, "bar")) return .bar;
+        return null;
+    }
+
+    fn parsePaneStateLine(raw: []const u8) ?ParsedPaneState {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len < 2 or line[0] != '%') return null;
+
+        var fields = std.mem.splitScalar(u8, line, ';');
+        const pane = fields.next() orelse return null;
+        const pane_id = std.fmt.parseInt(usize, pane[1..], 10) catch return null;
+        const cursor_x = parseOptionalInt(fields.next());
+        const cursor_y = parseOptionalInt(fields.next());
+        const cursor_visible = parseOptionalBool(fields.next());
+        const cursor_shape = parseCursorShape(fields.next());
+        const cursor_blinking = parseOptionalBool(fields.next());
+        const alternate_on = parseOptionalBool(fields.next()) orelse false;
+        const alternate_saved_x = parseOptionalInt(fields.next());
+        const alternate_saved_y = parseOptionalInt(fields.next());
+        const insert = parseOptionalBool(fields.next());
+        const wrap = parseOptionalBool(fields.next());
+        const keypad = parseOptionalBool(fields.next());
+        const cursor_keys = parseOptionalBool(fields.next());
+        const origin = parseOptionalBool(fields.next());
+        const mouse_all = parseOptionalBool(fields.next());
+        _ = parseOptionalBool(fields.next()); // mouse_any_flag is an aggregate.
+        const mouse_button = parseOptionalBool(fields.next());
+        const mouse_standard = parseOptionalBool(fields.next());
+        const mouse_utf8 = parseOptionalBool(fields.next());
+        const mouse_sgr = parseOptionalBool(fields.next());
+        const focus = parseOptionalBool(fields.next());
+        const bracketed_paste = parseOptionalBool(fields.next());
+        const scroll_top = parseOptionalInt(fields.next());
+        const scroll_bottom = parseOptionalInt(fields.next());
+        const pane_tabs = fields.next();
+
+        return .{
             .pane_id = pane_id,
-            .alternate_on = state.alternate_on,
-            .cursor_visible = state.cursor_visible,
-            .cursor_x = state.cursor_x,
-            .cursor_y = state.cursor_y,
+            .cursor_x = cursor_x,
+            .cursor_y = cursor_y,
+            .cursor_visible = cursor_visible,
+            .cursor_shape = cursor_shape,
+            .cursor_blinking = cursor_blinking,
+            .alternate_on = alternate_on,
+            .alternate_saved_x = alternate_saved_x,
+            .alternate_saved_y = alternate_saved_y,
+            .insert = insert,
+            .wrap = wrap,
+            .keypad = keypad,
+            .cursor_keys = cursor_keys,
+            .origin = origin,
+            .mouse_all = mouse_all,
+            .mouse_button = mouse_button,
+            .mouse_standard = mouse_standard,
+            .mouse_utf8 = mouse_utf8,
+            .mouse_sgr = mouse_sgr,
+            .focus = focus,
+            .bracketed_paste = bracketed_paste,
+            .scroll_top = scroll_top,
+            .scroll_bottom = scroll_bottom,
+            .pane_tabs = pane_tabs,
         };
+    }
+
+    fn appendPrivateMode(self: *Session, out: *std.ArrayListUnmanaged(u8), mode: usize, enabled: bool) Allocator.Error!void {
+        var buf: [32]u8 = undefined;
+        const seq = std.fmt.bufPrint(&buf, "\x1b[?{d}{c}", .{ mode, @as(u8, if (enabled) 'h' else 'l') }) catch unreachable;
+        try out.appendSlice(self.alloc, seq);
+    }
+
+    fn appendCursorPosition(
+        self: *Session,
+        out: *std.ArrayListUnmanaged(u8),
+        x: usize,
+        y: usize,
+    ) Allocator.Error!void {
+        var buf: [48]u8 = undefined;
+        const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch unreachable;
+        try out.appendSlice(self.alloc, seq);
+    }
+
+    fn buildPaneRestore(self: *Session, parsed: ParsedPaneState, out: *std.ArrayListUnmanaged(u8)) Allocator.Error!void {
+        if (parsed.insert) |enabled| try out.appendSlice(self.alloc, if (enabled) "\x1b[4h" else "\x1b[4l");
+        if (parsed.wrap) |enabled| try self.appendPrivateMode(out, 7, enabled);
+        if (parsed.keypad) |enabled| try out.appendSlice(self.alloc, if (enabled) "\x1b=" else "\x1b>");
+        if (parsed.cursor_keys) |enabled| try self.appendPrivateMode(out, 1, enabled);
+
+        if (parsed.mouse_all != null or parsed.mouse_button != null or parsed.mouse_standard != null) {
+            try out.appendSlice(self.alloc, "\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+            if (parsed.mouse_all == true) {
+                try out.appendSlice(self.alloc, "\x1b[?1003h");
+            } else if (parsed.mouse_button == true) {
+                try out.appendSlice(self.alloc, "\x1b[?1002h");
+            } else if (parsed.mouse_standard == true) {
+                try out.appendSlice(self.alloc, "\x1b[?1000h");
+            }
+        }
+        if (parsed.mouse_utf8 != null or parsed.mouse_sgr != null) {
+            try out.appendSlice(self.alloc, "\x1b[?1005l\x1b[?1006l");
+            if (parsed.mouse_sgr == true) {
+                try out.appendSlice(self.alloc, "\x1b[?1006h");
+            } else if (parsed.mouse_utf8 == true) {
+                try out.appendSlice(self.alloc, "\x1b[?1005h");
+            }
+        }
+        if (parsed.focus) |enabled| try self.appendPrivateMode(out, 1004, enabled);
+        if (parsed.bracketed_paste) |enabled| try self.appendPrivateMode(out, 2004, enabled);
+
+        if (parsed.scroll_top) |top| {
+            if (parsed.scroll_bottom) |bottom| {
+                var buf: [48]u8 = undefined;
+                const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d}r", .{ top + 1, bottom + 1 }) catch unreachable;
+                try out.appendSlice(self.alloc, seq);
+            }
+        }
+
+        if (parsed.pane_tabs) |tabs| {
+            try out.appendSlice(self.alloc, "\x1b[3g");
+            var it = std.mem.splitScalar(u8, tabs, ',');
+            while (it.next()) |field| {
+                const col = parseOptionalInt(field) orelse continue;
+                var buf: [32]u8 = undefined;
+                const seq = std.fmt.bufPrint(&buf, "\x1b[{d}G\x1bH", .{col + 1}) catch unreachable;
+                try out.appendSlice(self.alloc, seq);
+            }
+        }
+
+        if (parsed.origin) |enabled| try self.appendPrivateMode(out, 6, enabled);
+        if (parsed.cursor_shape) |shape| {
+            const style: ?u8 = switch (shape) {
+                .default => null,
+                .block => if (parsed.cursor_blinking orelse true) 1 else 2,
+                .underline => if (parsed.cursor_blinking orelse true) 3 else 4,
+                .bar => if (parsed.cursor_blinking orelse true) 5 else 6,
+            };
+            if (style) |value| {
+                var buf: [16]u8 = undefined;
+                const seq = std.fmt.bufPrint(&buf, "\x1b[{d} q", .{value}) catch unreachable;
+                try out.appendSlice(self.alloc, seq);
+            }
+        }
+        if (parsed.cursor_blinking) |enabled| try self.appendPrivateMode(out, 12, enabled);
+        if (parsed.cursor_x) |x| {
+            if (parsed.cursor_y) |absolute_y| {
+                const y = if (parsed.origin == true and parsed.scroll_top != null and absolute_y >= parsed.scroll_top.?)
+                    absolute_y - parsed.scroll_top.?
+                else
+                    absolute_y;
+                try self.appendCursorPosition(out, x, y);
+            }
+        }
+        if (parsed.cursor_visible) |enabled| try self.appendPrivateMode(out, 25, enabled);
+    }
+
+    fn setPaneState(self: *Session, parsed: ParsedPaneState) Allocator.Error!void {
+        var stored = PaneState{
+            .pane_id = parsed.pane_id,
+            .alternate_on = parsed.alternate_on,
+            .alternate_saved_x = parsed.alternate_saved_x,
+            .alternate_saved_y = parsed.alternate_saved_y,
+        };
+        errdefer stored.deinit(self.alloc);
+        try self.buildPaneRestore(parsed, &stored.restore);
+
         for (self.pane_states.items) |*existing| {
-            if (existing.pane_id == pane_id) {
+            if (existing.pane_id == parsed.pane_id) {
+                existing.deinit(self.alloc);
                 existing.* = stored;
                 return;
             }
@@ -544,43 +729,75 @@ pub const Session = struct {
         try self.pane_states.append(self.alloc, stored);
     }
 
-    fn findPaneState(self: *const Session, pane_id: usize) ?PaneState {
-        for (self.pane_states.items) |state| {
+    fn clearPaneStates(self: *Session) void {
+        for (self.pane_states.items) |*state| state.deinit(self.alloc);
+        self.pane_states.clearRetainingCapacity();
+    }
+
+    fn removePendingPaneState(self: *Session, pane_id: usize) void {
+        for (self.pane_states.items, 0..) |*state, i| {
+            if (state.pane_id != pane_id or !state.pending) continue;
+            state.deinit(self.alloc);
+            _ = self.pane_states.orderedRemove(i);
+            return;
+        }
+    }
+
+    fn findPaneStateMutable(self: *Session, pane_id: usize) ?*PaneState {
+        for (self.pane_states.items) |*state| {
             if (state.pane_id == pane_id) return state;
         }
         return null;
     }
 
-    fn activeCaptureScreen(state: PaneState) CaptureScreen {
+    fn findPaneState(self: *const Session, pane_id: usize) ?*const PaneState {
+        for (self.pane_states.items) |*state| {
+            if (state.pane_id == pane_id) return state;
+        }
+        return null;
+    }
+
+    fn activeCaptureScreen(state: *const PaneState) CaptureScreen {
         return if (state.alternate_on) .alternate else .primary;
     }
 
-    fn appendPaneCursorRestore(
+    fn appendPaneStateRestore(
         self: *Session,
         pane_id: usize,
         screen: CaptureScreen,
         out: *std.ArrayListUnmanaged(u8),
     ) Allocator.Error!void {
         const state = self.findPaneState(pane_id) orelse return;
-        if (screen != activeCaptureScreen(state)) return;
-
-        if (state.cursor_x) |x| {
-            if (state.cursor_y) |y| {
-                var buf: [48]u8 = undefined;
-                const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch unreachable;
-                try out.appendSlice(self.alloc, seq);
-            }
+        if (screen == activeCaptureScreen(state)) {
+            try out.appendSlice(self.alloc, state.restore.items);
+            return;
         }
-        if (state.cursor_visible) |visible| {
-            try out.appendSlice(self.alloc, if (visible) "\x1b[?25h" else "\x1b[?25l");
+
+        // With alternate_on=1, tmux's `capture-pane -a` returns the saved
+        // primary grid. Position its cursor before the following ?1049h so
+        // ghostty-vt saves the same primary cursor that tmux will restore when
+        // the TUI exits.
+        if (screen == .primary and state.alternate_on) {
+            if (state.alternate_saved_x) |x| {
+                if (state.alternate_saved_y) |y| {
+                    if (std.math.cast(u16, x) != null and std.math.cast(u16, y) != null)
+                        try self.appendCursorPosition(out, x, y);
+                }
+            }
         }
     }
 
-    fn writePaneCursorRestore(self: *Session, pane_id: usize) Allocator.Error!void {
-        const state = self.findPaneState(pane_id) orelse return;
-        self.scratch.clearRetainingCapacity();
-        try self.appendPaneCursorRestore(pane_id, activeCaptureScreen(state), &self.scratch);
-        if (self.scratch.items.len > 0) self.sink.write(pane_id, self.scratch.items);
+    fn applyPaneState(self: *Session, body: []const u8, req: PaneStateRequest) Allocator.Error!bool {
+        var applied = false;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw| {
+            const parsed = parsePaneStateLine(raw) orelse continue;
+            try self.setPaneState(parsed);
+            if (req.capture) try self.captureInitialPane(parsed.pane_id, parsed.alternate_on);
+            applied = true;
+        }
+        if (req.pane_id) |pane_id| self.removePendingPaneState(pane_id);
+        return applied;
     }
 
     fn removeWindowsNotIn(self: *Session, ids: []const usize) void {
@@ -598,30 +815,44 @@ pub const Session = struct {
         }
     }
 
-    /// Enqueue a `capture-pane` for a pane and remember it (FIFO) so the reply
-    /// can be routed back to the pane's sink to seed its visible screen on
-    /// attach. `-e` preserves SGR escapes. No `-J`: each visible row is one
-    /// line <= pane width, so writing it to a matched-width surface reproduces
-    /// the screen 1:1 without re-wrapping.
-    pub fn capturePane(self: *Session, pane_id: usize) Allocator.Error!void {
-        try self.capturePaneScreen(pane_id, .primary);
+    /// Queue the screen captures only after pane state is known. tmux's default
+    /// capture is the active grid; `-a` is the saved/inactive grid. Therefore an
+    /// active TUI must restore saved primary first, then current alternate.
+    fn captureInitialPane(self: *Session, pane_id: usize, alternate_on: bool) Allocator.Error!void {
+        if (alternate_on) {
+            try self.capturePaneScreen(pane_id, .primary, true);
+            try self.capturePaneScreen(pane_id, .alternate, false);
+        } else {
+            try self.capturePaneScreen(pane_id, .primary, false);
+        }
     }
 
-    pub fn capturePaneAlternate(self: *Session, pane_id: usize) Allocator.Error!void {
-        try self.capturePaneScreen(pane_id, .alternate);
-    }
-
-    fn capturePaneScreen(self: *Session, pane_id: usize, screen: CaptureScreen) Allocator.Error!void {
+    /// `saved_grid` selects tmux's `capture-pane -a`; `screen` is the semantic
+    /// WispTerm target that receives the reply.
+    fn capturePaneScreen(self: *Session, pane_id: usize, screen: CaptureScreen, saved_grid: bool) Allocator.Error!void {
         var buf: [64]u8 = undefined;
-        const s = switch (screen) {
-            .primary => std.fmt.bufPrint(&buf, "capture-pane -p -e -q -t %{d}\n", .{pane_id}) catch unreachable,
-            .alternate => std.fmt.bufPrint(&buf, "capture-pane -p -e -q -a -t %{d}\n", .{pane_id}) catch unreachable,
-        };
+        const s = if (saved_grid)
+            std.fmt.bufPrint(&buf, "capture-pane -p -e -q -a -t %{d}\n", .{pane_id}) catch unreachable
+        else
+            std.fmt.bufPrint(&buf, "capture-pane -p -e -q -t %{d}\n", .{pane_id}) catch unreachable;
         try self.enqueueCommand(s, .{ .capture = .{ .pane_id = pane_id, .screen = screen } });
     }
 
-    /// The `list-panes` format string shared between `start` and `refreshPaneMeta`.
-    const list_panes_cmd = "list-panes -s -F \"#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{alternate_on}\t#{cursor_flag}\t#{cursor_x}\t#{cursor_y}\"\n";
+    /// Use only printable delimiters in commands sent through the outer SSH
+    /// tty. tmux sanitizes literal control characters in control-mode command
+    /// arguments (a tab becomes `_`), which makes the reply impossible to
+    /// parse. The pane parser takes the last whitespace token as the command,
+    /// so paths containing spaces remain valid.
+    const list_panes_cmd = "list-panes -s -F \"#{pane_id} #{pane_current_path} #{pane_current_command}\"\n";
+    const list_windows_cmd = "list-windows -F \"#{window_id} #{window_active} #{window_layout} #{window_name}\"\n";
+    // Mirrors Ghostty's tmux Viewer pane-state query. Semicolons preserve empty
+    // fields on older tmux versions that do not expose every newer variable.
+    const pane_state_format =
+        "#{pane_id};#{cursor_x};#{cursor_y};#{cursor_flag};#{cursor_shape};#{cursor_blinking};" ++
+        "#{alternate_on};#{alternate_saved_x};#{alternate_saved_y};#{insert_flag};#{wrap_flag};#{keypad_flag};" ++
+        "#{keypad_cursor_flag};#{origin_flag};#{mouse_all_flag};#{mouse_any_flag};#{mouse_button_flag};" ++
+        "#{mouse_standard_flag};#{mouse_utf8_flag};#{mouse_sgr_flag};#{focus_flag};#{bracketed_paste};" ++
+        "#{scroll_region_upper};#{scroll_region_lower};#{pane_tabs}";
 
     /// Enqueue the attach bootstrap: tell tmux our client size and ask for the
     /// window list. (Parsing the list-windows reply for complete initial
@@ -629,15 +860,38 @@ pub const Session = struct {
     /// notifications.)
     pub fn start(self: *Session) Allocator.Error!void {
         try self.enqueueResize();
-        try self.enqueueCommand("list-windows -F \"#{window_id}\t#{window_active}\t#{window_layout}\t#{window_name}\"\n", .window_list);
-        try self.enqueueCommand(list_panes_cmd, .{ .pane_list = .{ .restore_cursor_after_metadata = true } });
+        try self.enqueueCommand(list_windows_cmd, .window_list);
+        try self.enqueueCommand(list_panes_cmd, .pane_list);
+    }
+
+    /// Ensure a pane Surface is seeded from tmux. Existing reconciled panes are
+    /// skipped during ordinary layout changes; a newly created Surface asks for
+    /// fresh state even if this pane id was seen before (for example after its
+    /// local tab was closed). Reconnect clears the cache, so reused Surfaces are
+    /// queried and seeded again as well.
+    pub fn requestPaneSeed(self: *Session, pane_id: usize, refresh: bool) Allocator.Error!void {
+        if (self.findPaneStateMutable(pane_id)) |state| {
+            if (state.pending or !refresh) return;
+            state.pending = true;
+        } else {
+            try self.pane_states.append(self.alloc, .{ .pane_id = pane_id, .pending = true });
+        }
+        errdefer self.removePendingPaneState(pane_id);
+
+        const command = try std.fmt.allocPrint(
+            self.alloc,
+            "display-message -p -t %{d} -F \"{s}\"\n",
+            .{ pane_id, pane_state_format },
+        );
+        defer self.alloc.free(command);
+        try self.enqueueCommand(command, .{ .pane_state = .{ .capture = true, .pane_id = pane_id } });
     }
 
     /// Re-query per-pane metadata (cwd + current command). Called periodically
     /// by the controller; cwd/command change infrequently so a coarse cadence
     /// is fine.
     pub fn refreshPaneMeta(self: *Session) Allocator.Error!void {
-        try self.enqueueCommand(list_panes_cmd, .{ .pane_list = .{} });
+        try self.enqueueCommand(list_panes_cmd, .pane_list);
     }
 
     pub fn resizeClient(self: *Session, cols: u16, rows: u16) Allocator.Error!void {
@@ -652,18 +906,36 @@ pub const Session = struct {
         try self.enqueueCommand(s, .ignore);
     }
 
-    /// Queue raw key bytes for a pane as a hex `send-keys` command.
+    /// Queue terminal input using tmux's long-standing hexadecimal key-name
+    /// syntax. `send-keys -H` is newer than tmux 2.7, which is still common on
+    /// long-lived servers; `0x<codepoint>` works there and on current tmux.
+    /// Decode valid UTF-8 so non-ASCII text is not encoded a second time by
+    /// tmux, while ASCII control/mouse bytes remain exact codepoints.
     pub fn sendKeys(self: *Session, pane_id: usize, raw: []const u8) Allocator.Error!void {
         const old_len = self.cmds.items.len;
         errdefer self.cmds.items.len = old_len;
 
         var head: [48]u8 = undefined;
-        const h = std.fmt.bufPrint(&head, "send-keys -t %{d} -H", .{pane_id}) catch unreachable;
+        const h = std.fmt.bufPrint(&head, "send-keys -t %{d}", .{pane_id}) catch unreachable;
         try self.cmds.appendSlice(self.alloc, h);
-        for (raw) |byte| {
-            var hb: [8]u8 = undefined;
-            const hs = std.fmt.bufPrint(&hb, " {x:0>2}", .{byte}) catch unreachable;
+
+        var i: usize = 0;
+        while (i < raw.len) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(raw[i]) catch 1;
+            const end = @min(raw.len, i + seq_len);
+            var codepoint: u21 = raw[i];
+            var advance: usize = 1;
+            if (seq_len > 1 and end - i == seq_len) {
+                const decoded: ?u21 = std.unicode.utf8Decode(raw[i..end]) catch null;
+                if (decoded) |cp| {
+                    codepoint = cp;
+                    advance = seq_len;
+                }
+            }
+            var hb: [16]u8 = undefined;
+            const hs = std.fmt.bufPrint(&hb, " 0x{x}", .{codepoint}) catch unreachable;
             try self.cmds.appendSlice(self.alloc, hs);
+            i += advance;
         }
         try self.cmds.append(self.alloc, '\n');
         try self.reply_queue.append(self.alloc, .ignore);
@@ -705,7 +977,8 @@ const WindowListLine = struct {
 
 fn parseWindowListLine(line: []const u8) ?WindowListLine {
     if (line.len < 2 or line[0] != '@') return null;
-    return parseTabbedWindowListLine(line);
+    if (std.mem.indexOfScalar(u8, line, '\t') != null) return parseTabbedWindowListLine(line);
+    return parseWhitespaceWindowListLine(line);
 }
 
 fn isWindowListReply(body: []const u8) bool {
@@ -735,6 +1008,26 @@ fn parseTabbedWindowListLine(line: []const u8) ?WindowListLine {
         .active = active,
         .layout_str = layout_str,
         .name = if (tab3) |idx| rest2[idx + 1 ..] else null,
+    };
+}
+
+fn parseWhitespaceWindowListLine(line: []const u8) ?WindowListLine {
+    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    const id = std.fmt.parseInt(usize, line[1..sp1], 10) catch return null;
+
+    const rest1 = std.mem.trimLeft(u8, line[sp1 + 1 ..], " ");
+    const sp2 = std.mem.indexOfScalar(u8, rest1, ' ') orelse return null;
+    const active = std.mem.eql(u8, rest1[0..sp2], "1");
+
+    const rest2 = std.mem.trimLeft(u8, rest1[sp2 + 1 ..], " ");
+    const sp3 = std.mem.indexOfScalar(u8, rest2, ' ');
+    const layout_str = if (sp3) |idx| rest2[0..idx] else rest2;
+    if (layout_str.len == 0) return null;
+    return .{
+        .id = id,
+        .active = active,
+        .layout_str = layout_str,
+        .name = if (sp3) |idx| std.mem.trimLeft(u8, rest2[idx + 1 ..], " ") else null,
     };
 }
 
@@ -885,6 +1178,33 @@ test "start enqueues the attach bootstrap commands" {
     const cmds = s.pendingCommands();
     try std.testing.expect(std.mem.indexOf(u8, cmds, "refresh-client -C 120x40\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmds, "list-windows") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, cmds, '\t') == null);
+}
+
+test "SSH tty bootstrap replies keep printable separators and reconcile" {
+    var col = Collector{ .alloc = std.testing.allocator };
+    defer col.deinit();
+    var log = EventLog{ .alloc = std.testing.allocator };
+    defer log.deinit();
+    var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
+    defer s.deinit();
+    s.events = log.eventSink();
+
+    try s.start();
+    try std.testing.expect(std.mem.indexOfScalar(u8, s.pendingCommands(), '\t') == null);
+
+    // A real `ssh -tt ... tmux -CC` attach first completes its own empty
+    // command block, then replies to the printable-space bootstrap queries.
+    try s.feed("\x1bP1000p%begin 1 1 0\n%end 1 1 0\n%session-changed $0 tui\n");
+    try s.feed("%begin 2 2 0\n@5 1 b262,80x24,0,0,5 TUI window\n%end 2 2 0\n");
+    try s.feed("%begin 3 3 0\n%5 /home/xzg/project with spaces pi\n%end 3 3 0\n");
+
+    try std.testing.expectEqual(@as(?usize, 5), log.layout_window);
+    try std.testing.expectEqual(@as(usize, 1), log.layout_panes);
+    try std.testing.expectEqualStrings("TUI window", s.findWindow(5).?.name.items);
+    try std.testing.expectEqual(@as(?usize, 5), log.last_pane_meta_id);
+    try std.testing.expectEqualStrings("/home/xzg/project with spaces", log.last_pane_meta_path.items);
+    try std.testing.expectEqualStrings("pi", log.last_pane_meta_cmd.items);
 }
 
 test "resizeClient updates size and queues a refresh" {
@@ -898,14 +1218,37 @@ test "resizeClient updates size and queues a refresh" {
     try std.testing.expect(std.mem.indexOf(u8, s.pendingCommands(), "refresh-client -C 100x30\n") != null);
 }
 
-test "sendKeys hex-encodes raw bytes for a pane" {
+test "sendKeys uses tmux 2.7-compatible hexadecimal key names" {
     var col = Collector{ .alloc = std.testing.allocator };
     defer col.deinit();
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
 
-    try s.sendKeys(4, "ls\n"); // l=0x6c s=0x73 \n=0x0a
-    try std.testing.expectEqualStrings("send-keys -t %4 -H 6c 73 0a\n", s.pendingCommands());
+    try s.sendKeys(4, "ls\n");
+    try std.testing.expectEqualStrings("send-keys -t %4 0x6c 0x73 0xa\n", s.pendingCommands());
+}
+
+test "sendKeys emits UTF-8 text as Unicode key names" {
+    var col = Collector{ .alloc = std.testing.allocator };
+    defer col.deinit();
+    var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
+    defer s.deinit();
+
+    try s.sendKeys(4, "Ãé中");
+    try std.testing.expectEqualStrings("send-keys -t %4 0xc3 0xe9 0x4e2d\n", s.pendingCommands());
+}
+
+test "sendKeys preserves legacy mouse report bytes on tmux 2.7" {
+    var col = Collector{ .alloc = std.testing.allocator };
+    defer col.deinit();
+    var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
+    defer s.deinit();
+
+    try s.sendKeys(5, "\x1b[MaC-");
+    try std.testing.expectEqualStrings(
+        "send-keys -t %5 0x1b 0x5b 0x4d 0x61 0x43 0x2d\n",
+        s.pendingCommands(),
+    );
 }
 
 test "splitPane emits split-window with the right orientation flag" {
@@ -997,7 +1340,6 @@ const EventLog = struct {
     last_pane_meta_id: ?usize = null,
     last_pane_meta_path: std.ArrayListUnmanaged(u8) = .empty,
     last_pane_meta_cmd: std.ArrayListUnmanaged(u8) = .empty,
-    last_pane_meta_alternate_on: bool = false,
 
     fn eventSink(self: *EventLog) Session.EventSink {
         return .{
@@ -1042,11 +1384,10 @@ const EventLog = struct {
             .split => |s| for (s.children) |*c| countLeaves(c, out),
         }
     }
-    fn onPaneMeta(ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8, alternate_on: bool) void {
+    fn onPaneMeta(ctx: *anyopaque, pane_id: usize, path: []const u8, cmd: []const u8) void {
         const self: *EventLog = @ptrCast(@alignCast(ctx));
         self.pane_meta_count += 1;
         self.last_pane_meta_id = pane_id;
-        self.last_pane_meta_alternate_on = alternate_on;
         self.last_pane_meta_path.clearRetainingCapacity();
         self.last_pane_meta_path.appendSlice(self.alloc, path) catch {};
         self.last_pane_meta_cmd.clearRetainingCapacity();
@@ -1194,7 +1535,7 @@ test "capture-pane reply is routed to the pane sink (scrollback seed)" {
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
 
-    try s.capturePane(5);
+    try s.capturePaneScreen(5, .primary, false);
     try std.testing.expect(std.mem.indexOf(u8, s.pendingCommands(), "capture-pane -p -e -q -t %5\n") != null);
 
     // The capture-pane reply: a %begin/%end block of plain pane content. It is
@@ -1202,21 +1543,21 @@ test "capture-pane reply is routed to the pane sink (scrollback seed)" {
     // primary-screen switch + clear+home so it paints from the top-left.
     try s.feed("%begin 1 1 0\nline-a\nline-b\n%end 1 1 0\n");
     try std.testing.expectEqual(@as(usize, 5), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hline-a\r\nline-b", col.buf.items);
+    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[0m\x1b[2J\x1b[Hline-a\r\nline-b\x1b[0m", col.buf.items);
 }
 
-test "alternate capture-pane reply enters alternate screen before seeding" {
+test "current alternate capture enters alternate screen before seeding" {
     var col = Collector{ .alloc = std.testing.allocator };
     defer col.deinit();
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
 
-    try s.capturePaneAlternate(5);
-    try std.testing.expect(std.mem.indexOf(u8, s.pendingCommands(), "capture-pane -p -e -q -a -t %5\n") != null);
+    try s.capturePaneScreen(5, .alternate, false);
+    try std.testing.expect(std.mem.indexOf(u8, s.pendingCommands(), "capture-pane -p -e -q -t %5\n") != null);
 
     try s.feed("%begin 1 1 0\ncodex\nready\n%end 1 1 0\n");
     try std.testing.expectEqual(@as(usize, 5), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049h\x1b[2J\x1b[Hcodex\r\nready", col.buf.items);
+    try std.testing.expectEqualSlices(u8, "\x1b[?1049h\x1b[0m\x1b[2J\x1b[Hcodex\r\nready\x1b[0m", col.buf.items);
 }
 
 test "EventSink default is a silent no-op" {
@@ -1238,11 +1579,11 @@ test "list-panes reply drives onPaneMeta per pane" {
     defer s.deinit();
     s.events = log.eventSink();
 
-    // Reply to: list-panes -s -F "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{alternate_on}"
+    // Reply to: list-panes -s -F "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}"
     try s.feed(
         "%begin 9 9 0\n" ++
-            "%1\t/home/u/proj\tnvim\t0\n" ++
-            "%2\t/var/log\ttail\t1\n" ++
+            "%1\t/home/u/proj\tnvim\n" ++
+            "%2\t/var/log\ttail\n" ++
             "%end 9 9 0\n",
     );
 
@@ -1250,52 +1591,74 @@ test "list-panes reply drives onPaneMeta per pane" {
     try std.testing.expectEqual(@as(?usize, 2), log.last_pane_meta_id);
     try std.testing.expectEqualStrings("/var/log", log.last_pane_meta_path.items);
     try std.testing.expectEqualStrings("tail", log.last_pane_meta_cmd.items);
-    try std.testing.expect(log.last_pane_meta_alternate_on);
 }
 
-test "pane cursor state is restored after capture-pane seeding" {
+test "active alternate restore seeds saved primary first and restores TUI modes" {
     var col = Collector{ .alloc = std.testing.allocator };
     defer col.deinit();
-    var log = EventLog{ .alloc = std.testing.allocator };
-    defer log.deinit();
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
-    s.events = log.eventSink();
 
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{ .restore_cursor_after_metadata = true } });
-    try s.capturePane(5);
+    try s.requestPaneSeed(5, false);
+    try s.requestPaneSeed(5, false);
+    try std.testing.expect(std.mem.indexOf(u8, s.pendingCommands(), "display-message -p -t %5 -F") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, s.pendingCommands(), "display-message -p -t %5 -F"));
+    s.clearCommands();
+    try s.feed(
+        "%begin 1 1 0\n" ++
+            // cursor x/y/visible/shape/blink; alt + saved cursor; terminal,
+            // mouse, focus/paste, scroll region, and tab-stop state.
+            "%5;12;7;0;bar;0;1;3;4;1;0;1;1;1;1;1;0;0;0;1;1;1;2;20;8,16\n" ++
+            "%end 1 1 0\n",
+    );
 
-    // tmux reports 0-based cursor coordinates. cursor_flag=0 means hidden.
-    try s.feed("%begin 1 1 0\n%5\t/proc\ttop\t0\t0\t12\t7\n%end 1 1 0\n");
-    try std.testing.expectEqual(@as(usize, 5), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[8;13H\x1b[?25l", col.buf.items);
+    const commands = s.pendingCommands();
+    const saved_at = std.mem.indexOf(u8, commands, "capture-pane -p -e -q -a -t %5\n").?;
+    const current_at = std.mem.indexOf(u8, commands, "capture-pane -p -e -q -t %5\n").?;
+    try std.testing.expect(saved_at < current_at);
+
+    // -a is tmux's saved/inactive grid. With alternate_on=1 that is the
+    // primary shell, and its saved cursor must be positioned before ?1049h.
+    try s.feed("%begin 2 2 0\nSHELL\n%end 2 2 0\n");
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x1b[?1049l\x1b[0m\x1b[2J\x1b[HSHELL\x1b[0m\x1b[5;4H",
+        col.buf.items,
+    );
 
     col.buf.clearRetainingCapacity();
-    try s.feed("%begin 2 2 0\nline-a\nline-b\n%end 2 2 0\n");
-    try std.testing.expectEqual(@as(usize, 5), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hline-a\r\nline-b\x1b[8;13H\x1b[?25l", col.buf.items);
+    try s.feed("%begin 3 3 0\nTUI\n%end 3 3 0\n");
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x1b[?1049h\x1b[0m\x1b[2J\x1b[HTUI\x1b[0m" ++
+            "\x1b[4h\x1b[?7l\x1b=\x1b[?1h" ++
+            "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1003h" ++
+            "\x1b[?1005l\x1b[?1006l\x1b[?1006h" ++
+            "\x1b[?1004h\x1b[?2004h\x1b[3;21r" ++
+            "\x1b[3g\x1b[9G\x1bH\x1b[17G\x1bH" ++
+            "\x1b[?6h\x1b[6 q\x1b[?12l\x1b[6;13H\x1b[?25l",
+        col.buf.items,
+    );
 }
 
-test "periodic pane metadata records cursor state without injecting it" {
+test "pane state accepts empty optional fields from tmux 3.2" {
     var col = Collector{ .alloc = std.testing.allocator };
     defer col.deinit();
-    var log = EventLog{ .alloc = std.testing.allocator };
-    defer log.deinit();
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
-    s.events = log.eventSink();
 
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{} });
+    try s.reply_queue.append(std.testing.allocator, .{ .pane_state = .{} });
+    // cursor_shape, cursor_blinking, focus_flag, and bracketed_paste are empty
+    // on tmux 3.2, while mouse/scroll/tab state remains available.
+    try s.feed("%begin 1 1 0\n%0;10;0;1;;;1;7;0;0;1;0;0;0;1;1;0;0;0;1;;;1;3;8,16\n%end 1 1 0\n");
 
-    // A normal refresh should update cached tmux state only; injecting cursor
-    // controls every refresh can race with live pane output.
-    try s.feed("%begin 1 1 0\n%5\t/proc\ttop\t0\t0\t12\t7\n%end 1 1 0\n");
-    try std.testing.expectEqual(@as(usize, 0), col.buf.items.len);
-
-    try s.capturePane(5);
-    try s.feed("%begin 2 2 0\nline-a\n%end 2 2 0\n");
-    try std.testing.expectEqual(@as(usize, 5), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hline-a\x1b[8;13H\x1b[?25l", col.buf.items);
+    const state = s.findPaneState(0).?;
+    try std.testing.expect(state.alternate_on);
+    try std.testing.expect(std.mem.indexOf(u8, state.restore.items, "\x1b[?1003h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.restore.items, "\x1b[?1006h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.restore.items, "\x1b[2;4r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.restore.items, "\x1b[?1004") == null);
+    try std.testing.expectEqual(@as(usize, 0), s.pendingCommands().len);
 }
 
 test "a pending capture does not steal a list-panes reply (startup ordering)" {
@@ -1311,9 +1674,9 @@ test "a pending capture does not steal a list-panes reply (startup ordering)" {
     // queued during the earlier list-windows reconcile before the list-panes
     // reply arrives. The typed command FIFO must route the reply to pane
     // metadata, NOT consume a capture seed.
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{ .restore_cursor_after_metadata = true } });
-    try s.capturePane(1);
-    try s.capturePane(2);
+    try s.reply_queue.append(std.testing.allocator, .pane_list);
+    try s.capturePaneScreen(1, .primary, false);
+    try s.capturePaneScreen(2, .primary, false);
     try s.feed("%begin 7 7 0\n%1\t/home/u\tnvim\n%2\t/var/log\ttail\n%end 7 7 0\n");
 
     try std.testing.expectEqual(@as(usize, 2), log.pane_meta_count);
@@ -1328,7 +1691,7 @@ test "split-window reply cannot be stolen by a later capture-pane" {
     defer s.deinit();
 
     try s.splitPane(1, .horizontal);
-    try s.capturePane(2);
+    try s.capturePaneScreen(2, .primary, false);
 
     // A split-window command can reply with the new pane id while the layout
     // reconcile has already queued a capture for that pane. The split reply
@@ -1340,7 +1703,7 @@ test "split-window reply cannot be stolen by a later capture-pane" {
 
     try s.feed("%begin 4 4 0\nreal pane\n%end 4 4 0\n");
     try std.testing.expectEqual(@as(usize, 2), col.last_pane);
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hreal pane", col.buf.items);
+    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[0m\x1b[2J\x1b[Hreal pane\x1b[0m", col.buf.items);
 }
 
 test "list-panes reply is parsed even if stale replies precede it" {
@@ -1353,10 +1716,10 @@ test "list-panes reply is parsed even if stale replies precede it" {
     s.events = log.eventSink();
 
     try s.reply_queue.append(std.testing.allocator, .ignore);
-    try s.capturePane(44);
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{} });
+    try s.capturePaneScreen(44, .primary, false);
+    try s.reply_queue.append(std.testing.allocator, .pane_list);
 
-    try s.feed("%begin 1 1 0\n%44     /data/xzg_data/Plant-Root-Atlas-Project/01.gene-family-analysis zsh 0 1 2 3\n%end 1 1 0\n");
+    try s.feed("%begin 1 1 0\n%44     /data/xzg_data/Plant-Root-Atlas-Project/01.gene-family-analysis zsh\n%end 1 1 0\n");
 
     try std.testing.expectEqual(@as(usize, 1), log.pane_meta_count);
     try std.testing.expectEqual(@as(?usize, 44), log.last_pane_meta_id);
@@ -1374,8 +1737,8 @@ test "pane metadata is never seeded as capture content" {
     defer s.deinit();
     s.events = log.eventSink();
 
-    try s.capturePane(44);
-    try s.feed("%begin 1 1 0\n%44     /data/xzg_data/Plant-Root-Atlas-Project/01.gene-family-analysis zsh 0 1 2 2\n%end 1 1 0\n");
+    try s.capturePaneScreen(44, .primary, false);
+    try s.feed("%begin 1 1 0\n%44     /data/xzg_data/Plant-Root-Atlas-Project/01.gene-family-analysis zsh\n%end 1 1 0\n");
 
     try std.testing.expectEqual(@as(usize, 1), log.pane_meta_count);
     try std.testing.expectEqual(@as(?usize, 44), log.last_pane_meta_id);
@@ -1391,23 +1754,23 @@ test "an empty or errored pane-list reply does not consume a later capture" {
     var s = Session.init(std.testing.allocator, col.sink(), 80, 24);
     defer s.deinit();
 
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{ .restore_cursor_after_metadata = true } });
-    try s.capturePane(5);
+    try s.reply_queue.append(std.testing.allocator, .pane_list);
+    try s.capturePaneScreen(5, .primary, false);
     try s.feed("%begin 7 7 0\n%end 7 7 0\n");
     try std.testing.expectEqual(@as(usize, 1), s.reply_queue.items.len);
     try std.testing.expectEqual(@as(usize, 0), col.buf.items.len);
 
     try s.feed("%begin 8 8 0\nline-a\n%end 8 8 0\n");
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hline-a", col.buf.items);
+    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[0m\x1b[2J\x1b[Hline-a\x1b[0m", col.buf.items);
 
     col.buf.clearRetainingCapacity();
-    try s.reply_queue.append(std.testing.allocator, .{ .pane_list = .{ .restore_cursor_after_metadata = true } });
-    try s.capturePane(6);
+    try s.reply_queue.append(std.testing.allocator, .pane_list);
+    try s.capturePaneScreen(6, .primary, false);
     try s.feed("%begin 9 9 0\nboom\n%error 9 9 0\n");
     try std.testing.expectEqual(@as(usize, 1), s.reply_queue.items.len);
 
     try s.feed("%begin 10 10 0\nline-b\n%end 10 10 0\n");
-    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[2J\x1b[Hline-b", col.buf.items);
+    try std.testing.expectEqualSlices(u8, "\x1b[?1049l\x1b[0m\x1b[2J\x1b[Hline-b\x1b[0m", col.buf.items);
 }
 
 test "a realistic capture reply is seeded even with pane-list-like ids elsewhere" {
@@ -1419,7 +1782,7 @@ test "a realistic capture reply is seeded even with pane-list-like ids elsewhere
     defer s.deinit();
     s.events = log.eventSink();
 
-    try s.capturePane(5);
+    try s.capturePaneScreen(5, .primary, false);
     // Real scrollback: NOT every line is `%<id>\t..`, so it's a capture, not pane-list.
     try s.feed("%begin 1 1 0\n$ ls\nfile.txt  %notapaneline\n%end 1 1 0\n");
 

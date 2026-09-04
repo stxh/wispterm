@@ -38,9 +38,10 @@ const impl = switch (backendForOs(builtin.os.tag)) {
     .unsupported => @import("notifications_unsupported.zig"),
 };
 
-/// True on platforms with a native desktop-notification backend (macOS and Linux).
+/// True on platforms with a native desktop-notification backend (Windows,
+/// macOS, and Linux).
 pub const supports_desktop_notifications = switch (backendForOs(builtin.os.tag)) {
-    .macos, .linux => true,
+    .windows, .macos, .linux => true,
     else => false,
 };
 
@@ -60,9 +61,33 @@ pub fn requestAttention(handle: NativeHandle) void {
     impl.requestAttention(handle);
 }
 
-/// Post a native desktop notification (macOS toast). No-op where unsupported.
+/// Remember the window a later toast click should present. No-op where the
+/// backend has no click-to-focus path.
+pub fn bindWindow(handle: NativeHandle) void {
+    impl.bindWindow(handle);
+}
+
+/// Post a native desktop notification (Windows tray balloon / macOS toast /
+/// Linux notify-send). No-op where unsupported.
 pub fn showDesktopNotification(title: [:0]const u8, body: [:0]const u8) void {
     impl.showDesktopNotification(title, body);
+}
+
+/// Consume a tray/toast click posted to the window's WndProc. Returns true
+/// when the message was a notification click (the backend presents the
+/// bound window). Always false on platforms without a tray callback.
+pub fn handleCallback(
+    msg: platform_window.MessageId,
+    wparam: platform_window.WordParam,
+    lparam: platform_window.LongParam,
+) bool {
+    return impl.handleCallback(msg, wparam, lparam);
+}
+
+/// Release any process-wide notification resources (Windows removes its tray
+/// icon). Safe to call when nothing was shown; no-op on other platforms.
+pub fn cleanup() void {
+    impl.cleanup();
 }
 
 /// Current cached authorization status (synchronous, cheap).
@@ -95,6 +120,15 @@ test "notifications exposes bell and attention API shape" {
     const show_info = @typeInfo(@TypeOf(showDesktopNotification)).@"fn";
     try std.testing.expectEqual(@as(usize, 2), show_info.params.len);
     try std.testing.expect(show_info.return_type.? == void);
+
+    const bind_info = @typeInfo(@TypeOf(bindWindow)).@"fn";
+    try std.testing.expectEqual(@as(usize, 1), bind_info.params.len);
+    try std.testing.expect(bind_info.params[0].type.? == NativeHandle);
+    try std.testing.expect(bind_info.return_type.? == void);
+
+    const click_info = @typeInfo(@TypeOf(handleCallback)).@"fn";
+    try std.testing.expectEqual(@as(usize, 3), click_info.params.len);
+    try std.testing.expect(click_info.return_type.? == bool);
 
     const status_info = @typeInfo(@TypeOf(notificationAuthStatus)).@"fn";
     try std.testing.expectEqual(@as(usize, 0), status_info.params.len);

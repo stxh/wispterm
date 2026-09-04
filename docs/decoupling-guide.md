@@ -447,9 +447,9 @@ gate — you must first remove one, or use the pattern the guard names.
 | Guard | Freezes | Today's ceiling | Escape hatch |
 |---|---|---|---|
 | `file_size_guard` | lines in any `src/**/*.zig` (whole tree, future files too) | < 10,000 | split by responsibility; never raise the limit |
-| `global_state_guard` | top-level `g_*` / `threadlocal` in the watched integration/session files | AppWindow 66, input 49, overlays 32, assistant/conversation/session 16 | new state → an explicit state struct (`appwindow/state.zig`, …) |
+| `global_state_guard` | top-level `g_*` / `threadlocal` in the watched integration/session files | AppWindow 66, input 48, overlays 32, assistant/conversation/session 15 | new state → an explicit state struct (`appwindow/state.zig`, …) |
 | `import_hub_guard` | `pub const X = @import(...)` re-exports in `AppWindow.zig` | 17 | import the real module directly, not via `AppWindow.X` |
-| `side_effect_guard` | direct `g_force_rebuild` / `g_cells_valid` writes in the watched integration/session files | AppWindow 45, input 81, overlays 10, assistant/conversation/session 0 | return a `UiEffect`; land it via `AppWindow.applyUiEffect` |
+| `side_effect_guard` | direct `g_force_rebuild` / `g_cells_valid` writes in the watched integration/session files | AppWindow 44, input 81, overlays 0, assistant/conversation/session 0 | return a `UiEffect`; land it via `AppWindow.applyUiEffect` |
 
 They run in `zig build test` and — since `test-full` is now a superset of `test`
 — in the pre-merge gate. The file-size backstop is also a standalone command,

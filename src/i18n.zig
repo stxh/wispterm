@@ -77,6 +77,7 @@ pub const Strings = struct {
     pf_detail: []const u8,
     pf_legend: []const u8,
     pf_form_legend: []const u8,
+    pf_profile_list: []const u8,
 
     // —— Skill Center 面板 ——
     sc_local: []const u8,
@@ -289,6 +290,19 @@ pub const Strings = struct {
     toast_feishu_restart: []const u8,
     toast_feishu_scan_failed: []const u8,
     toast_feishu_scan_success: []const u8,
+
+    // —— 工作区 Recipe（命名布局）——
+    recipe_form_title: []const u8,
+    recipe_form_hint: []const u8,
+    recipe_name_label: []const u8,
+    recipe_save_row: []const u8,
+    toast_recipe_save_failed: []const u8,
+    toast_recipe_invalid_name: []const u8,
+    toast_recipe_name_taken: []const u8,
+    toast_recipe_import_failed: []const u8,
+    toast_recipe_restore_failed: []const u8,
+    toast_recipe_ai_failed: []const u8,
+    toast_recipe_open_hint: []const u8,
 };
 
 const en = Strings{
@@ -354,6 +368,7 @@ const en = Strings{
     .pf_detail = "Manage SSH port forwarding rules",
     .pf_legend = "[n] new   [e] edit   [space] start/stop   [r] restart   [a] auto   [d] delete   [esc] close/cancel",
     .pf_form_legend = "[up/down] move   [left/right/space] change   [enter] save   [esc] cancel",
+    .pf_profile_list = "SSH profiles",
 
     .sc_local = "Local",
     .sc_wsl = "WSL",
@@ -557,6 +572,18 @@ const en = Strings{
     .toast_feishu_restart = "Feishu setting updated — restart WispTerm to apply",
     .toast_feishu_scan_failed = "App creation failed, please retry",
     .toast_feishu_scan_success = "App created, credentials filled in — please save",
+
+    .recipe_form_title = "Save Workspace Recipe",
+    .recipe_form_hint = "Type a name, Enter to save",
+    .recipe_name_label = "Name:",
+    .recipe_save_row = "Save Recipe",
+    .toast_recipe_save_failed = "Could not save recipe",
+    .toast_recipe_invalid_name = "Invalid recipe name",
+    .toast_recipe_name_taken = "A recipe with that name already exists",
+    .toast_recipe_import_failed = "Could not import recipe (invalid file)",
+    .toast_recipe_restore_failed = "Recipe could not be restored",
+    .toast_recipe_ai_failed = "Some AI tabs could not be restored",
+    .toast_recipe_open_hint = "Type a recipe name in the Command Palette and press Enter",
 };
 
 const zh_CN = Strings{
@@ -622,6 +649,7 @@ const zh_CN = Strings{
     .pf_detail = "管理 SSH 端口转发规则",
     .pf_legend = "[n] 新建   [e] 编辑   [space] 启停   [r] 重启   [a] 自动启动   [d] 删除   [esc] 关闭/取消",
     .pf_form_legend = "[上/下] 切换字段   [左/右 或 空格] 切换选项   [enter] 保存   [esc] 取消",
+    .pf_profile_list = "SSH 配置",
 
     .sc_local = "本地",
     .sc_wsl = "WSL",
@@ -825,6 +853,18 @@ const zh_CN = Strings{
     .toast_feishu_restart = "飞书配置已更新，重启 WispTerm 生效",
     .toast_feishu_scan_failed = "创建应用失败，请重试",
     .toast_feishu_scan_success = "应用已创建，凭据已回填，请保存",
+
+    .recipe_form_title = "保存工作区 Recipe",
+    .recipe_form_hint = "输入名称，回车保存",
+    .recipe_name_label = "名称：",
+    .recipe_save_row = "保存 Recipe",
+    .toast_recipe_save_failed = "保存 Recipe 失败",
+    .toast_recipe_invalid_name = "Recipe 名称无效",
+    .toast_recipe_name_taken = "同名 Recipe 已存在",
+    .toast_recipe_import_failed = "导入 Recipe 失败（文件无效）",
+    .toast_recipe_restore_failed = "Recipe 恢复失败",
+    .toast_recipe_ai_failed = "部分 AI 标签页无法恢复",
+    .toast_recipe_open_hint = "在命令面板输入 Recipe 名称并回车即可打开",
 };
 
 // Set once at startup before any UI thread exists (see main.zig startup wiring).
@@ -937,9 +977,11 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .load_openssh_config => "导入 OpenSSH 配置",
         .new_agent => "新建副驾",
         .toggle_ai_copilot => "开 / 关 Copilot",
+        .send_to_copilot => "发送给 Copilot",
         .manage_ai_profiles => "管理 AI 配置",
         .manage_mcp_servers => "MCP 服务器",
         .select_agent_history => "副驾历史",
+        .fork_session => "分叉会话",
         .split_right => "向右分屏",
         .split_down => "向下分屏",
         .split_left => "向左分屏",
@@ -981,7 +1023,13 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .open_port_forwarding => "端口转发",
         .split_preview => "分屏预览",
         .run_memory_digest_now => "立即运行记忆摘要",
+        .show_prompt_queue => "查看 Prompt 队列",
+        .clear_prompt_queue => "清空 Prompt 队列",
         .star_repo => "给项目点个 Star（赞一个）",
+        .save_workspace_recipe => "保存工作区 Recipe",
+        .open_recipe => "打开 Recipe",
+        .import_recipe => "导入 Recipe",
+        .export_recipe => "导出 Recipe",
     };
 }
 
@@ -995,9 +1043,11 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .load_openssh_config => "把 ~/.ssh/config 导入为 SSH profile",
         .new_agent => "用默认 AI 配置打开一个新的副驾标签页",
         .toggle_ai_copilot => "在当前终端上打开或关闭 Copilot 侧栏",
+        .send_to_copilot => "把终端选中文本（或最近输出）作为上下文卡片发给 Copilot",
         .manage_ai_profiles => "创建、编辑或删除已保存的 AI 配置",
         .manage_mcp_servers => "添加、编辑、测试或删除 MCP 工具服务器",
         .select_agent_history => "打开命令中心的副驾历史选择器",
+        .fork_session => "把当前 Copilot 对话复制成一个互不影响的新会话",
         .split_right => "在右侧创建一个面板",
         .split_down => "在下方创建一个面板",
         .split_left => "在左侧创建一个面板",
@@ -1039,7 +1089,13 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .open_port_forwarding => "管理 SSH 端口转发规则",
         .split_preview => "在右侧打开预览面板",
         .run_memory_digest_now => "扫描 AI 对话记录并生成今日摘要",
+        .show_prompt_queue => "查看、重排、编辑或删除 AI 忙时排队的 prompt",
+        .clear_prompt_queue => "丢弃 AI 忙时排队的全部 prompt",
         .star_repo => "打开 WispTerm 的 GitHub 仓库,给它点个 Star",
+        .save_workspace_recipe => "把当前窗口的布局保存为一个命名 Recipe",
+        .open_recipe => "把已保存的 Recipe 恢复到新窗口（在这里搜索名称）",
+        .import_recipe => "把分享来的 Recipe JSON 文件导入到你的 Recipe 列表",
+        .export_recipe => "把当前窗口的布局导出成可分享的 Recipe JSON 文件",
     };
 }
 

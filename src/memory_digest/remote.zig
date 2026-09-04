@@ -187,9 +187,8 @@ fn collectProvider(
 /// Same shape as session.zig's providerFindCommand ("mtime<TAB>size<TAB>path",
 /// newest first, capped at 500) but WITHOUT the `-size -2048k` filter: this
 /// module needs to see oversize candidates (to count and skip them) rather
-/// than have `find` drop them silently. Only used for claude/codex roots
-/// (this module's RemoteRootsSpec has no reasonix support), so no reasonix
-/// name filter is needed here.
+/// than have `find` drop them silently. This is only used for Claude/Codex
+/// roots, so no provider-specific name filter is needed here.
 ///
 /// `| sort | head` would swallow find's own exit code (BSD find rejects
 /// `-printf` outright), making "find failed" indistinguishable from "0

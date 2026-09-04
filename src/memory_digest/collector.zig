@@ -279,7 +279,6 @@ pub fn locateSessionFile(
         .claude => roots.claude_projects_dir,
         .codex => roots.codex_sessions_dir,
         .wispterm => roots.wispterm_sessions_dir,
-        else => null,
     } orelse return null;
     var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch return null;
     defer dir.close();
@@ -325,7 +324,6 @@ pub fn loadFullSessionByPath(
                 .ended_at_ms = sess.updated_at_ms,
             }, sess.messages, 0);
         },
-        else => return null,
     }
     if (list.items.len == 0) return null; // subagent or empty
     return list.items[0];

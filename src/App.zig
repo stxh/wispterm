@@ -11,11 +11,13 @@ const AppWindow = @import("AppWindow.zig");
 const ai_chat = @import("assistant/conversation/session.zig");
 const app_metadata = @import("app_metadata.zig");
 const keybind = @import("keybind.zig");
+const memory_digest_scheduler = @import("memory_digest/scheduler.zig");
 const console_host_policy = @import("platform/console_host_policy.zig");
 const platform_com = @import("platform/com.zig");
 const platform_display = @import("platform/display.zig");
 const font_backend = @import("platform/font_backend.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
+const platform_notifications = @import("platform/notifications.zig");
 const platform_thread_control = @import("platform/thread_control.zig");
 const window_backend = @import("platform/window_backend.zig");
 const remote = @import("remote_client.zig");
@@ -157,6 +159,10 @@ startup_update_check_started: bool,
 windows: std.ArrayListUnmanaged(*AppWindow),
 mutex: std.Thread.Mutex,
 window_threads: std.ArrayListUnmanaged(std.Thread),
+/// Spawned window threads that have not yet returned from `windowThreadMain`.
+/// Counted independently of `window_threads` so a failed `append` that detaches
+/// the handle still waits for the worker to finish teardown.
+live_window_threads: std.atomic.Value(usize) = .init(0),
 
 // Position for next spawned window (cascading)
 next_window_x: ?i32 = null,
@@ -165,6 +171,11 @@ next_window_y: ?i32 = null,
 // CWD for next spawned window (working directory inheritance)
 next_window_cwd: platform_pty_command.CwdBuffer = undefined,
 next_window_cwd_len: usize = 0,
+
+// Recipe file path for next spawned window (named-workspace restore). When
+// set, the new window restores this recipe instead of opening a default tab.
+next_window_recipe_path: [std.fs.max_path_bytes]u8 = undefined,
+next_window_recipe_path_len: usize = 0,
 
 // ============================================================================
 // Initialization
@@ -504,6 +515,21 @@ pub fn takeInitialCwd(self: *App, out_buf: *platform_pty_command.CwdBuffer) usiz
     @memcpy(out_buf[0..len], self.next_window_cwd[0..len]);
     out_buf[len] = 0;
     self.next_window_cwd_len = 0;
+    return len;
+}
+
+/// Take the recipe path staged for the next spawned window (copies into the
+/// provided buffer, clears source). Returns the path length, or 0 when no
+/// recipe was staged.
+pub fn takeInitialRecipePath(self: *App, out_buf: *[std.fs.max_path_bytes]u8) usize {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    if (self.next_window_recipe_path_len == 0) return 0;
+
+    const len = self.next_window_recipe_path_len;
+    @memcpy(out_buf[0..len], self.next_window_recipe_path[0..len]);
+    self.next_window_recipe_path_len = 0;
     return len;
 }
 
@@ -1040,7 +1066,11 @@ pub fn requestNewWindow(self: *App, parent_handle: ?window_backend.NativeHandle,
 
     self.mutex.unlock();
 
+    // Increment before spawn so the worker cannot finish and decrement first
+    // (that would wrap the counter). Roll back if spawn itself fails.
+    _ = self.live_window_threads.fetchAdd(1, .monotonic);
     const thread = std.Thread.spawn(.{}, windowThreadMain, .{self}) catch |err| {
+        _ = self.live_window_threads.fetchSub(1, .monotonic);
         std.debug.print("Failed to spawn window thread: {}\n", .{err});
         return;
     };
@@ -1054,8 +1084,25 @@ pub fn requestNewWindow(self: *App, parent_handle: ?window_backend.NativeHandle,
     };
 }
 
+/// Request a new window that restores the named-workspace recipe at
+/// `recipe_path` instead of opening a default tab. The path is staged in a
+/// slot (same pattern as next_window_cwd) and consumed by the new window's
+/// startup branch.
+pub fn requestNewWindowWithRecipe(self: *App, parent_handle: ?window_backend.NativeHandle, recipe_path: []const u8) void {
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const len = @min(recipe_path.len, self.next_window_recipe_path.len);
+        @memcpy(self.next_window_recipe_path[0..len], recipe_path[0..len]);
+        self.next_window_recipe_path_len = len;
+    }
+    self.requestNewWindow(parent_handle, null);
+}
+
 /// Thread entry point for spawned windows.
 fn windowThreadMain(app: *App) void {
+    defer _ = app.live_window_threads.fetchSub(1, .acq_rel);
+
     // Initialize the native UI thread apartment for platform backends.
     const com_apartment = platform_com.initUiThread();
     defer com_apartment.deinit();
@@ -1098,6 +1145,16 @@ fn windowThreadMain(app: *App) void {
 
 /// Wait for all spawned window threads to finish.
 fn joinAllWindowThreads(self: *App) void {
+    // On macOS the main thread owns the GCD main queue. Worker windows destroy
+    // NSWindow (and WKWebView) via dispatch_sync onto that queue, so a blocking
+    // Thread.join() here starves teardown and deadlocks for ~30s (issue #611).
+    // Ghostty does not hit this: its AppKit host closes windows on the main
+    // thread already. Keep pumping until every worker has left windowThreadMain.
+    if (comptime builtin.os.tag == .macos) {
+        const thread_join = @import("appwindow/thread_join.zig");
+        thread_join.pumpWhileLive(&self.live_window_threads, window_backend.pumpAppEvents, 0.05);
+    }
+
     // Take ownership of the thread list
     self.mutex.lock();
     const threads = self.window_threads.toOwnedSlice(self.allocator) catch {
@@ -1153,6 +1210,7 @@ pub fn deinit(self: *App) void {
     self.joinAllWindowThreads();
     self.joinUpdateThread();
     self.joinDownloadThread();
+    memory_digest_scheduler.deinit();
 
     if (self.remote_client) |client| {
         client.destroy();
@@ -1184,6 +1242,9 @@ pub fn deinit(self: *App) void {
 
     self.port_forward_manager.deinit();
 
+    // Remove the Windows tray icon (no-op elsewhere) before the process exits.
+    platform_notifications.cleanup();
+
     // Free owned string copies
     self.allocator.free(self.font_family);
     freeOptStr(self.allocator, self.font_family_cjk);
@@ -1201,6 +1262,26 @@ pub fn deinit(self: *App) void {
 
     self.windows.deinit(self.allocator);
     self.window_threads.deinit(self.allocator);
+}
+
+test "app: macOS window-thread join pumps the main queue (issue 611)" {
+    const source = @embedFile("App.zig");
+    const join_fn = "fn joinAllWindowThreads";
+    const join_at = std.mem.indexOf(u8, source, join_fn) orelse return error.MissingJoin;
+    const body = source[join_at..@min(source.len, join_at + 1500)];
+    try std.testing.expect(std.mem.indexOf(u8, body, "live_window_threads") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pumpWhileLive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pumpAppEvents") != null);
+
+    const spawn_fn = "pub fn requestNewWindow(self: *App,";
+    const spawn_at = std.mem.indexOf(u8, source, spawn_fn) orelse return error.MissingSpawn;
+    const spawn_body = source[spawn_at..@min(source.len, spawn_at + 2500)];
+    try std.testing.expect(std.mem.indexOf(u8, spawn_body, "live_window_threads.fetchAdd") != null);
+
+    const thread_fn = "fn windowThreadMain";
+    const thread_at = std.mem.indexOf(u8, source, thread_fn) orelse return error.MissingThreadMain;
+    const thread_body = source[thread_at..@min(source.len, thread_at + 400)];
+    try std.testing.expect(std.mem.indexOf(u8, thread_body, "live_window_threads.fetchSub") != null);
 }
 
 test "app: updateConfig refreshes configured shell command" {

@@ -9,7 +9,7 @@ const scp = @import("../ssh/scp.zig");
 const platform_clipboard = @import("../platform/clipboard.zig");
 const platform_remote_file = @import("../platform/remote_file.zig");
 const Surface = @import("../Surface.zig");
-const selection_unit = @import("../selection_unit.zig");
+const ghostty_vt = @import("ghostty-vt");
 const file_drop_path = @import("file_drop_path.zig");
 const ai_chat_composer_layout = @import("../assistant/conversation/composer_layout.zig");
 
@@ -436,11 +436,12 @@ pub fn copyAiChatSpanToClipboard(chat: *AppWindow.ai_chat.Session, message_index
     }
 }
 
-pub fn copySelectionToClipboard() void {
-    const surface = selectionSurfaceForClipboard() orelse return;
-    const allocator = AppWindow.g_allocator orelse return;
-
-    if (!surface.selection.active) return;
+/// Owned text of the given surface's active selection, or null when the
+/// surface has no active selection or the selection is empty. Caller frees.
+/// Holds the surface render-state lock while reading cells, so call it on the
+/// UI thread only.
+pub fn allocSelectionText(allocator: std.mem.Allocator, surface: *Surface) ?[]u8 {
+    if (!surface.selection.active) return null;
 
     var start_row = surface.selection.start_row;
     var start_col = surface.selection.start_col;
@@ -452,86 +453,61 @@ pub fn copySelectionToClipboard() void {
         std.mem.swap(usize, &start_col, &end_col);
     }
 
-    // Collect each selected row's text plus its soft-wrap flag, then join.
-    // Soft-wrapped rows (a visually wrapped logical line, e.g. a long path)
-    // must copy back as a single line — see selection_unit.joinSelectionRows.
-    var rows: std.ArrayListUnmanaged(selection_unit.SelectionRow) = .empty;
-    defer {
-        for (rows.items) |r| allocator.free(r.text);
-        rows.deinit(allocator);
-    }
-
-    // Lock while reading terminal cells
     surface.render_state.mutex.lock();
-    const screen = surface.terminal.screens.active;
-    const grid_cols = @max(@as(usize, 1), @as(usize, @intCast(surface.size.grid.cols)));
-    var row: usize = start_row;
-    while (row <= end_row) : (row += 1) {
-        const row_start_col = if (row == start_row) start_col else 0;
-        var row_end_col = if (row == end_row) end_col else grid_cols - 1;
-        if (row_start_col >= grid_cols) continue;
-        row_end_col = @min(row_end_col, grid_cols - 1);
-        if (row_start_col > row_end_col) continue;
-
-        var row_buf: std.ArrayListUnmanaged(u8) = .empty;
-        var col: usize = row_start_col;
-        while (col <= row_end_col) : (col += 1) {
-            const cell_data = screen.pages.getCell(.{ .screen = .{
-                .x = @intCast(col),
-                .y = @intCast(row),
-            } }) orelse continue;
-
-            // Skip spacer cells for wide characters — the actual codepoint
-            // lives in the head cell; spacers are layout-only.
-            const wide_val: u2 = @intFromEnum(cell_data.cell.wide);
-            if (wide_val == 2 or wide_val == 3) continue; // spacer_tail / spacer_head
-
-            const cp = cell_data.cell.codepoint();
-            if (cp == 0 or cp == ' ') {
-                row_buf.append(allocator, ' ') catch continue;
-            } else {
-                var buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(@intCast(cp), &buf) catch continue;
-                row_buf.appendSlice(allocator, buf[0..len]) catch continue;
-
-                // Append grapheme cluster continuation codepoints (emoji ZWJ sequences, etc.)
-                if (cell_data.cell.hasGrapheme()) {
-                    const page = &cell_data.node.data;
-                    if (page.lookupGrapheme(cell_data.cell)) |extra_cps| {
-                        for (extra_cps) |ecp| {
-                            const elen = std.unicode.utf8Encode(@intCast(ecp), &buf) catch continue;
-                            row_buf.appendSlice(allocator, buf[0..elen]) catch {};
-                        }
-                    }
-                }
-            }
-        }
-
-        // Read the soft-wrap flag in the same .screen coordinate space as the
-        // cells above so it stays correct when the viewport is scrolled.
-        const wraps_next = wn: {
-            const pin = screen.pages.pin(.{ .screen = .{
-                .x = 0,
-                .y = @intCast(row),
-            } }) orelse break :wn false;
-            break :wn pin.rowAndCell().row.wrap;
-        };
-
-        const owned = row_buf.toOwnedSlice(allocator) catch {
-            row_buf.deinit(allocator);
-            continue;
-        };
-        rows.append(allocator, .{ .text = owned, .wraps_next = wraps_next }) catch {
-            allocator.free(owned);
-            continue;
-        };
+    defer surface.render_state.mutex.unlock();
+    const text = allocScreenSelectionText(
+        allocator,
+        surface.terminal.screens.active,
+        start_col,
+        start_row,
+        end_col,
+        end_row,
+    ) orelse return null;
+    if (text.len == 0) {
+        allocator.free(text);
+        return null;
     }
-    surface.render_state.mutex.unlock();
+    return text;
+}
 
-    const text = selection_unit.joinSelectionRows(allocator, rows.items) catch return;
+fn allocScreenSelectionText(
+    allocator: std.mem.Allocator,
+    screen: *ghostty_vt.Screen,
+    start_col: usize,
+    start_row: usize,
+    end_col: usize,
+    end_row: usize,
+) ?[]u8 {
+    const start = screen.pages.pin(.{ .screen = .{
+        .x = @intCast(start_col),
+        .y = @intCast(start_row),
+    } }) orelse return null;
+    const end = screen.pages.pin(.{ .screen = .{
+        .x = @intCast(end_col),
+        .y = @intCast(end_row),
+    } }) orelse return null;
+    const text = screen.selectionString(allocator, .{
+        .sel = ghostty_vt.Selection.init(start, end, false),
+        .trim = false,
+    }) catch return null;
     defer allocator.free(text);
+    return std.mem.replaceOwned(u8, allocator, text, "\n", "\r\n") catch null;
+}
 
-    if (text.len == 0) return;
+/// Owned text of the active terminal selection (the focused surface's, or any
+/// selected surface in the active tab), or null when nothing is selected.
+/// Caller frees.
+pub fn allocActiveSelectionText(allocator: std.mem.Allocator) ?[]u8 {
+    const surface = selectionSurfaceForClipboard() orelse return null;
+    return allocSelectionText(allocator, surface);
+}
+
+pub fn copySelectionToClipboard() void {
+    const surface = selectionSurfaceForClipboard() orelse return;
+    const allocator = AppWindow.g_allocator orelse return;
+
+    const text = allocSelectionText(allocator, surface) orelse return;
+    defer allocator.free(text);
 
     if (copyTextToClipboard(text)) {
         overlays.showCopyToast(text.len);
@@ -688,4 +664,56 @@ pub fn writeTextToActivePty(text: []const u8) void {
 
 pub fn writeTextToSurfacePty(surface: *Surface, text: []const u8) void {
     writeToPty(surface, text);
+}
+
+test "terminal selection copy unwraps visual line wrapping (issue 595)" {
+    var terminal = try ghostty_vt.Terminal.init(std.testing.allocator, .{
+        .cols = 8,
+        .rows = 6,
+        .max_scrollback = 64,
+    });
+    defer terminal.deinit(std.testing.allocator);
+
+    var stream = terminal.vtStream();
+    defer stream.deinit();
+    const line = "PowerShell-long-output-remains-continuous";
+    stream.nextSlice(line);
+
+    const last = line.len - 1;
+    const copied = allocScreenSelectionText(
+        std.testing.allocator,
+        terminal.screens.active,
+        0,
+        0,
+        last % 8,
+        last / 8,
+    ) orelse return error.ExpectedSelectionText;
+    defer std.testing.allocator.free(copied);
+
+    try std.testing.expectEqualStrings(line, copied);
+}
+
+test "terminal selection copy preserves hard line breaks as CRLF" {
+    var terminal = try ghostty_vt.Terminal.init(std.testing.allocator, .{
+        .cols = 16,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer terminal.deinit(std.testing.allocator);
+
+    var stream = terminal.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("first\r\nsecond");
+
+    const copied = allocScreenSelectionText(
+        std.testing.allocator,
+        terminal.screens.active,
+        0,
+        0,
+        "second".len - 1,
+        1,
+    ) orelse return error.ExpectedSelectionText;
+    defer std.testing.allocator.free(copied);
+
+    try std.testing.expectEqualStrings("first\r\nsecond", copied);
 }

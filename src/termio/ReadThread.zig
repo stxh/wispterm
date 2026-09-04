@@ -20,6 +20,11 @@ const read_coalesce = @import("read_coalesce.zig");
 /// accept arbitrary buffer sizes.
 const READ_BUF_SIZE = 64 * 1024;
 
+/// After PTY EOF/EIO, retry waitpid this long so a single WNOHANG cannot
+/// leave a defunct child. Short enough that a process which closed the
+/// slave and kept running cannot hang the reader thread.
+const CHILD_REAP_TIMEOUT_MS: u64 = 250;
+
 pub fn threadMain(surface: *Surface) void {
     defer surface.markStopped();
 
@@ -38,7 +43,7 @@ pub fn threadMain(surface: *Surface) void {
         };
         if (bytes_read == 0) {
             if (!surface.exited.load(.acquire)) {
-                surface.markExited(.eof, surface.pollExitStatus());
+                surface.markExited(.eof, surface.command.waitUntilReaped(CHILD_REAP_TIMEOUT_MS));
             }
             return;
         }
@@ -99,7 +104,7 @@ fn drainResizeOutput(
 
         if (bytes_read == 0) {
             if (!surface.exited.load(.acquire)) {
-                surface.markExited(.eof, surface.pollExitStatus());
+                surface.markExited(.eof, surface.command.waitUntilReaped(CHILD_REAP_TIMEOUT_MS));
             }
             return;
         }
@@ -149,7 +154,7 @@ fn drainAvailableOutput(
         };
         if (bytes_read == 0) {
             if (!surface.exited.load(.acquire)) {
-                surface.markExited(.eof, surface.pollExitStatus());
+                surface.markExited(.eof, surface.command.waitUntilReaped(CHILD_REAP_TIMEOUT_MS));
             }
             return;
         }
@@ -212,7 +217,7 @@ fn handleReadError(surface: *Surface, err: anyerror) ReadErrorAction {
     if (surface.exited.load(.acquire)) return .stop;
 
     if (err == error.BrokenPipe) {
-        surface.markExited(.broken_pipe, surface.pollExitStatus());
+        surface.markExited(.broken_pipe, surface.command.waitUntilReaped(CHILD_REAP_TIMEOUT_MS));
         return .stop;
     }
 

@@ -244,7 +244,7 @@ pub fn wslSessionToolName() []const u8 {
 }
 
 pub fn wslSessionToolDescription() []const u8 {
-    return "Run a POSIX shell command in the selected already-open WSL terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt and the command returns; for R, Python, Codex, Claude Code, other REPLs, or launching full-screen agent apps, use terminal_repl_exec.";
+    return "Run a POSIX shell command in the selected already-open WSL terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt and the command returns. Never use heredocs or multiline shell input to create or feed scripts; use write_file for the content, including large or temporary scripts, then run the file separately. For R, Python, Codex, Claude Code, other REPLs, or launching full-screen agent apps, use terminal_repl_exec.";
 }
 
 pub fn wslSessionToolPropertiesJson() []const u8 {
@@ -505,8 +505,12 @@ test "platform pty command exposes command lifecycle API" {
 
     const wait_info = @typeInfo(@TypeOf(CommandType.wait)).@"fn";
     try std.testing.expectEqual(@as(usize, 2), wait_info.params.len);
-    try std.testing.expect(wait_info.params[0].type.? == *const CommandType);
+    try std.testing.expect(wait_info.params[0].type.? == *CommandType);
     try std.testing.expect(wait_info.params[1].type.? == bool);
+
+    const reap_info = @typeInfo(@TypeOf(CommandType.waitUntilReaped)).@"fn";
+    try std.testing.expectEqual(@as(usize, 2), reap_info.params.len);
+    try std.testing.expect(reap_info.params[0].type.? == *CommandType);
 
     const deinit_info = @typeInfo(@TypeOf(CommandType.deinit)).@"fn";
     try std.testing.expectEqual(@as(usize, 1), deinit_info.params.len);
@@ -740,6 +744,9 @@ test "platform pty command exposes session launcher layout by target OS" {
     try std.testing.expect(!wslSessionToolsEnabledForOs(.linux));
     try std.testing.expect(std.mem.indexOf(u8, terminalSelectToolDescriptionForOs(.windows), wslSessionToolName()) != null);
     try std.testing.expect(std.mem.indexOf(u8, terminalSelectToolDescriptionForOs(.linux), wslSessionToolName()) == null);
+    try std.testing.expect(std.mem.indexOf(u8, wslSessionToolDescription(), "Never use heredocs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wslSessionToolDescription(), "write_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wslSessionToolDescription(), "large or temporary scripts") != null);
 }
 
 test "platform pty command derives session launcher layout from WSL presence" {

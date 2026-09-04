@@ -260,6 +260,18 @@ pub fn skillsDirFromEnvForOs(
     return pathInConfigDirFromEnvForOs(allocator, os_tag, env, "skills");
 }
 
+pub fn recipesDir(allocator: std.mem.Allocator) ![]const u8 {
+    return pathInConfigDir(allocator, "recipes");
+}
+
+pub fn recipesDirFromEnvForOs(
+    allocator: std.mem.Allocator,
+    os_tag: std.Target.Os.Tag,
+    env: Env,
+) ![]const u8 {
+    return pathInConfigDirFromEnvForOs(allocator, os_tag, env, "recipes");
+}
+
 pub fn commandsDir(allocator: std.mem.Allocator) ![]const u8 {
     return pathInConfigDir(allocator, "commands");
 }
@@ -669,6 +681,12 @@ test "platform dirs expose app skill roots" {
     const expected_tools = try std.fs.path.join(allocator, &.{ "/home/alice", ".config", app_dir_name, "tools" });
     defer allocator.free(expected_tools);
     try std.testing.expectEqualStrings(expected_tools, tools);
+
+    const recipes = try recipesDirFromEnvForOs(allocator, .linux, env);
+    defer allocator.free(recipes);
+    const expected_recipes = try std.fs.path.join(allocator, &.{ "/home/alice", ".config", app_dir_name, "recipes" });
+    defer allocator.free(expected_recipes);
+    try std.testing.expectEqualStrings(expected_recipes, recipes);
 }
 
 test "platform dirs resolve downloads directory per OS" {

@@ -14,6 +14,10 @@ const NativeHandle = platform_window.NativeHandle;
 /// The terminal bell is already handled by the pty/VT layer writing '\x07'.
 pub fn bell() void {}
 
+pub fn bindWindow(handle: NativeHandle) void {
+    _ = handle;
+}
+
 /// Flash the taskbar/window-decoration entry until the window is focused.
 pub fn requestAttention(handle: NativeHandle) void {
     const win: *c.SDL_Window = @ptrCast(handle);
@@ -39,3 +43,17 @@ pub fn notificationAuthStatus() u8 {
 
 /// No authorization request needed on Linux.
 pub fn requestNotificationAuth() void {}
+
+pub fn handleCallback(
+    msg: platform_window.MessageId,
+    wparam: platform_window.WordParam,
+    lparam: platform_window.LongParam,
+) bool {
+    _ = msg;
+    _ = wparam;
+    _ = lparam;
+    return false;
+}
+
+/// notify-send spawns leave nothing to tear down.
+pub fn cleanup() void {}

@@ -4,7 +4,9 @@ const source_mod = @import("source.zig");
 const session_persist = @import("../../session_persist.zig");
 const codex_provider = @import("provider_codex.zig");
 const claude_provider = @import("provider_claude.zig");
-const reasonix_provider = @import("provider_reasonix.zig");
+const kimi_provider = @import("provider_kimi.zig");
+const opencode_provider = @import("provider_opencode.zig");
+const process_runner = @import("../../process_runner.zig");
 const remote_file = @import("../../platform/remote_file.zig");
 const ssh_connection = @import("../../ssh/connection.zig");
 const ai_history_cache = @import("cache.zig");
@@ -17,6 +19,14 @@ pub const MAX_TRANSCRIPT_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_METADATA_PREFIX_BYTES: usize = MAX_METADATA_FILE_BYTES - 4096;
 pub const MAX_SCAN_METADATA_FILES: usize = 256;
 pub const MAX_SCAN_METADATA_BYTES: u64 = 48 * 1024 * 1024;
+
+/// OpenCode is CLI-driven (SQLite storage), so scans/exports spawn the
+/// `opencode` binary instead of walking files. Bounded so a hung or chatty
+/// CLI degrades to a scan warning instead of wedging the worker thread.
+const OPENCODE_CLI_TIMEOUT_MS: u64 = 15_000;
+const OPENCODE_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OPENCODE_EXPORT_MAX_BYTES: usize = 32 * 1024 * 1024;
+const OPENCODE_REMOTE_LIST_COMMAND = "opencode session list --format json 2>/dev/null";
 
 pub const ScanBudget = struct {
     max_files: usize = MAX_SCAN_METADATA_FILES,
@@ -130,7 +140,7 @@ pub const WslScannerHost = struct {
 
     fn loadTranscript(_: *anyopaque, allocator: std.mem.Allocator, meta: types.SessionMeta) ![]types.TranscriptMessage {
         var command_buf: [2048]u8 = undefined;
-        const command = try remoteCatCommand(meta.source_path, command_buf[0..]);
+        const command = try remoteTranscriptCommand(meta, command_buf[0..]);
         const bytes = remote_file.wslExecCapped(allocator, command, MAX_TRANSCRIPT_FILE_BYTES) orelse return error.RemoteExecFailed;
         defer allocator.free(bytes);
         return try parseTranscriptBytes(allocator, meta.provider, bytes);
@@ -163,7 +173,7 @@ pub const SshScannerHost = struct {
     fn loadTranscript(ctx: *anyopaque, allocator: std.mem.Allocator, meta: types.SessionMeta) ![]types.TranscriptMessage {
         const self: *SshScannerHost = @ptrCast(@alignCast(ctx));
         var command_buf: [2048]u8 = undefined;
-        const command = try remoteCatCommand(meta.source_path, command_buf[0..]);
+        const command = try remoteTranscriptCommand(meta, command_buf[0..]);
         const bytes = try remote_file.sshExecCaptureCapped(allocator, self.conn, command, MAX_TRANSCRIPT_FILE_BYTES);
         defer allocator.free(bytes);
         return try parseTranscriptBytes(allocator, meta.provider, bytes);
@@ -757,7 +767,8 @@ pub const Session = struct {
             } else switch (row.provider) {
                 .codex => counts.codex += 1,
                 .claude => counts.claude += 1,
-                .reasonix => counts.reasonix += 1,
+                .kimi => counts.kimi += 1,
+                .opencode => counts.opencode += 1,
             }
         }
         return counts;
@@ -1027,17 +1038,20 @@ pub fn scanLocalFilesystemWithCacheSink(
             }
         }
     }
-    if (source.providers.reasonix) {
-        if (source.reasonix_root_override) |root| {
-            try scanner.scanProviderRoot(.reasonix, root);
+    if (source.providers.kimi) {
+        if (source.kimi_root_override) |root| {
+            try scanner.scanProviderRoot(.kimi, root);
         } else {
             var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (source_mod.defaultRoot(.reasonix, home, &root_buf)) |root| {
-                try scanner.scanProviderRoot(.reasonix, root);
+            if (source_mod.defaultRoot(.kimi, home, &root_buf)) |root| {
+                try scanner.scanProviderRoot(.kimi, root);
             } else {
                 scanner.warning_count += 1;
             }
         }
+    }
+    if (source.providers.opencode) {
+        try scanner.scanOpencodeCli();
     }
     for (source.extra_roots) |root| {
         if (!providerEnabled(source, root.provider)) continue;
@@ -1057,6 +1071,10 @@ pub fn scanLocalFilesystemWithCacheSink(
     }
     const cache_update = try scanner.cache_records.toOwnedSlice(allocator);
     scanner.freeCandidates();
+    if (scanner.kimi_index) |bytes| {
+        allocator.free(bytes);
+        scanner.kimi_index = null;
+    }
     return .{
         .rows = rows,
         .authoritative = authoritative,
@@ -1070,6 +1088,13 @@ pub fn scanLocalFilesystemWithCacheSink(
 }
 
 pub fn loadLocalTranscript(allocator: std.mem.Allocator, meta: types.SessionMeta) ![]types.TranscriptMessage {
+    if (meta.provider == .opencode) {
+        const argv = [_][]const u8{ "opencode", "export", meta.session_id };
+        const bytes = try runOpencodeCli(allocator, &argv, OPENCODE_EXPORT_MAX_BYTES);
+        defer allocator.free(bytes);
+        return try opencode_provider.parseTranscript(allocator, bytes);
+    }
+
     const bytes = if (std.fs.path.isAbsolute(meta.source_path)) blk: {
         const file = try std.fs.openFileAbsolute(meta.source_path, .{});
         defer file.close();
@@ -1084,40 +1109,49 @@ fn parseTranscriptBytes(allocator: std.mem.Allocator, provider: types.ProviderId
     return switch (provider) {
         .codex => try codex_provider.parseTranscript(allocator, bytes),
         .claude => try claude_provider.parseTranscript(allocator, bytes),
-        .reasonix => try reasonix_provider.parseTranscript(allocator, bytes),
+        .kimi => try kimi_provider.parseTranscript(allocator, bytes),
+        .opencode => try opencode_provider.parseTranscript(allocator, bytes),
     };
 }
 
 pub fn providerFindCommand(provider: types.ProviderId, root: []const u8, out: []u8) ![]const u8 {
-    var reasonix_root_buf: [1024]u8 = undefined;
-    const find_root = providerFindRoot(provider, root, &reasonix_root_buf) catch return error.CommandTooLong;
+    var kimi_root_buf: [1024]u8 = undefined;
+    const find_root = providerFindRoot(provider, root, &kimi_root_buf) catch return error.CommandTooLong;
     var quoted_buf: [1024]u8 = undefined;
     const quoted = remote_file.shellQuote(&quoted_buf, find_root) orelse return error.CommandTooLong;
-    const reasonix_filter = if (provider == .reasonix) " ! -name '*.events.jsonl'" else "";
+    const file_selector = if (provider == .kimi) " -path '*/agents/main/wire.jsonl'" else " -name '*.jsonl'";
     // GNU find: emit "mtime<TAB>size<TAB>path", newest first, capped. The \t and \n
     // are literal escapes for find -printf (single-quoted so the shell preserves them).
-    return std.fmt.bufPrint(out, "find {s} -type f -name '*.jsonl'{s} -printf '%T@\\t%s\\t%p\\n' 2>/dev/null | sort -rn | head -500", .{ quoted, reasonix_filter }) catch error.CommandTooLong;
+    return std.fmt.bufPrint(out, "find {s} -type f{s} -printf '%T@\\t%s\\t%p\\n' 2>/dev/null | sort -rn | head -500", .{ quoted, file_selector }) catch error.CommandTooLong;
 }
 
 /// Fallback for environments without GNU `find -printf` (e.g. BSD): path-only,
 /// no stamps. Used when the primary command returns nothing.
 pub fn providerFindCommandPlain(provider: types.ProviderId, root: []const u8, out: []u8) ![]const u8 {
-    var reasonix_root_buf: [1024]u8 = undefined;
-    const find_root = providerFindRoot(provider, root, &reasonix_root_buf) catch return error.CommandTooLong;
+    var kimi_root_buf: [1024]u8 = undefined;
+    const find_root = providerFindRoot(provider, root, &kimi_root_buf) catch return error.CommandTooLong;
     var quoted_buf: [1024]u8 = undefined;
     const quoted = remote_file.shellQuote(&quoted_buf, find_root) orelse return error.CommandTooLong;
-    const reasonix_filter = if (provider == .reasonix) " ! -name '*.events.jsonl'" else "";
-    return std.fmt.bufPrint(out, "find {s} -type f -name '*.jsonl'{s} | head -500", .{ quoted, reasonix_filter }) catch error.CommandTooLong;
+    const file_selector = if (provider == .kimi) " -path '*/agents/main/wire.jsonl'" else " -name '*.jsonl'";
+    return std.fmt.bufPrint(out, "find {s} -type f{s} | head -500", .{ quoted, file_selector }) catch error.CommandTooLong;
 }
 
 fn providerFindRoot(provider: types.ProviderId, root: []const u8, out: []u8) ![]const u8 {
+    const trimmed = std.mem.trimRight(u8, root, "/\\");
     return switch (provider) {
-        .codex, .claude => root,
-        .reasonix => if (std.mem.eql(u8, std.fs.path.basename(root), "sessions"))
-            root
+        .codex, .claude, .opencode => root,
+        .kimi => if (pathEndsWithSegment(trimmed, "sessions"))
+            trimmed
         else
-            std.fmt.bufPrint(out, "{s}/sessions", .{root}) catch error.CommandTooLong,
+            std.fmt.bufPrint(out, "{s}/sessions", .{trimmed}) catch error.CommandTooLong,
     };
+}
+
+fn pathEndsWithSegment(path: []const u8, segment: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, segment)) return false;
+    if (path.len == segment.len) return true;
+    const separator = path[path.len - segment.len - 1];
+    return separator == '/' or separator == '\\';
 }
 
 const RemoteCandidate = struct {
@@ -1150,6 +1184,20 @@ pub fn remoteCatCommand(path: []const u8, out: []u8) ![]const u8 {
     var quoted_buf: [1024]u8 = undefined;
     const quoted = remote_file.shellQuote(&quoted_buf, path) orelse return error.CommandTooLong;
     return std.fmt.bufPrint(out, "cat {s}", .{quoted}) catch error.CommandTooLong;
+}
+
+/// OpenCode transcripts are exported through the CLI, not read from a file.
+pub fn opencodeExportCommand(session_id: []const u8, out: []u8) ![]const u8 {
+    var quoted_buf: [1024]u8 = undefined;
+    const quoted = remote_file.shellQuote(&quoted_buf, session_id) orelse return error.CommandTooLong;
+    return std.fmt.bufPrint(out, "opencode export {s} 2>/dev/null", .{quoted}) catch error.CommandTooLong;
+}
+
+/// Remote transcript command for a row: file cat for the file-based providers,
+/// CLI export for OpenCode.
+fn remoteTranscriptCommand(meta: types.SessionMeta, out: []u8) ![]const u8 {
+    if (meta.provider == .opencode) return opencodeExportCommand(meta.session_id, out);
+    return remoteCatCommand(meta.source_path, out);
 }
 
 pub fn remoteHeadCommand(path: []const u8, byte_count: usize, out: []u8) ![]const u8 {
@@ -1210,17 +1258,20 @@ pub fn scanRemoteFilesystemSink(allocator: std.mem.Allocator, source: source_mod
             }
         }
     }
-    if (source.providers.reasonix) {
-        if (source.reasonix_root_override) |root| {
-            try scanner.scanProviderRoot(.reasonix, root);
+    if (source.providers.kimi) {
+        if (source.kimi_root_override) |root| {
+            try scanner.scanProviderRoot(.kimi, root);
         } else {
             var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (source_mod.defaultRoot(.reasonix, home, &root_buf)) |root| {
-                try scanner.scanProviderRoot(.reasonix, root);
+            if (source_mod.defaultRoot(.kimi, home, &root_buf)) |root| {
+                try scanner.scanProviderRoot(.kimi, root);
             } else {
                 scanner.warning_count += 1;
             }
         }
+    }
+    if (source.providers.opencode) {
+        try scanner.scanOpencodeCli();
     }
     for (source.extra_roots) |root| {
         if (!providerEnabled(source, root.provider)) continue;
@@ -1238,6 +1289,10 @@ pub fn scanRemoteFilesystemSink(allocator: std.mem.Allocator, source: source_mod
         allocator.free(rows);
     }
     const cache_update = try scanner.cache_records.toOwnedSlice(allocator);
+    if (scanner.kimi_index) |bytes| {
+        allocator.free(bytes);
+        scanner.kimi_index = null;
+    }
     return .{
         .rows = rows,
         .authoritative = authoritative,
@@ -1252,7 +1307,7 @@ pub fn scanRemoteFilesystemSink(allocator: std.mem.Allocator, source: source_mod
 
 pub fn loadRemoteTranscript(allocator: std.mem.Allocator, host: RemoteExecHost, meta: types.SessionMeta) ![]types.TranscriptMessage {
     var command_buf: [2048]u8 = undefined;
-    const command = try remoteCatCommand(meta.source_path, command_buf[0..]);
+    const command = try remoteTranscriptCommand(meta, command_buf[0..]);
     const bytes = try host.exec(host.ctx, allocator, command);
     defer allocator.free(bytes);
 
@@ -1269,7 +1324,8 @@ pub fn freeTranscript(allocator: std.mem.Allocator, provider: types.ProviderId, 
     switch (provider) {
         .codex => codex_provider.freeTranscript(allocator, messages),
         .claude => claude_provider.freeTranscript(allocator, messages),
-        .reasonix => reasonix_provider.freeTranscript(allocator, messages),
+        .kimi => kimi_provider.freeTranscript(allocator, messages),
+        .opencode => opencode_provider.freeTranscript(allocator, messages),
     }
 }
 
@@ -1360,6 +1416,49 @@ const RowEmitter = struct {
     }
 };
 
+/// Run the `opencode` CLI locally and return owned stdout. Spawn failure,
+/// non-zero exit, timeout, and cancellation all collapse to
+/// error.OpencodeCliFailed so callers degrade to a scan warning.
+fn runOpencodeCli(allocator: std.mem.Allocator, argv: []const []const u8, max_stdout_bytes: usize) ![]u8 {
+    var result = process_runner.runCapture(allocator, argv, .{
+        .timeout_ms = OPENCODE_CLI_TIMEOUT_MS,
+        .max_stdout_bytes = max_stdout_bytes,
+        .max_stderr_bytes = 64 * 1024,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SpawnFailed => return error.OpencodeCliFailed,
+    };
+    defer result.deinit(allocator);
+    if (result.timed_out or result.cancelled) return error.OpencodeCliFailed;
+    switch (result.termination) {
+        .exited => |code| if (code != 0) return error.OpencodeCliFailed,
+        .killed => return error.OpencodeCliFailed,
+    }
+    return try allocator.dupe(u8, result.stdout);
+}
+
+/// Parse `opencode session list --format json` output and emit one row per
+/// session. Rows bypass the file-candidate cache: the CLI is the scan, so
+/// there is no per-file work to skip. Non-JSON noise (e.g. an older CLI
+/// printing a table) counts as one warning instead of failing the scan.
+fn emitOpencodeSessionList(allocator: std.mem.Allocator, emitter: *RowEmitter, warning_count: *u32, json_bytes: []const u8) !void {
+    const metas = try opencode_provider.parseSessionList(allocator, json_bytes);
+    defer allocator.free(metas);
+    if (metas.len == 0) {
+        const trimmed = std.mem.trim(u8, json_bytes, " \t\r\n");
+        if (trimmed.len > 0 and !std.mem.startsWith(u8, trimmed, "[")) warning_count.* += 1;
+        return;
+    }
+
+    var emitted: usize = 0;
+    defer for (metas[emitted..]) |meta| freeMetadata(allocator, meta);
+    for (metas) |meta| {
+        if (emitter.aborted) break;
+        try emitter.emit(meta);
+        emitted += 1;
+    }
+}
+
 const LocalScan = struct {
     const Candidate = struct {
         provider: types.ProviderId,
@@ -1375,6 +1474,7 @@ const LocalScan = struct {
     emitter: RowEmitter,
     candidates: std.ArrayListUnmanaged(Candidate) = .empty,
     cache_records: std.ArrayListUnmanaged(ai_history_cache.CacheRecord) = .empty,
+    kimi_index: ?[]u8 = null,
     warning_count: u32 = 0,
 
     fn deinit(self: *LocalScan) void {
@@ -1382,6 +1482,7 @@ const LocalScan = struct {
         self.cache_records.deinit(self.allocator);
         self.emitter.deinit();
         self.freeCandidates();
+        if (self.kimi_index) |bytes| self.allocator.free(bytes);
     }
 
     fn freeCandidates(self: *LocalScan) void {
@@ -1393,6 +1494,9 @@ const LocalScan = struct {
     }
 
     fn scanProviderRoot(self: *LocalScan, provider: types.ProviderId, root: []const u8) !void {
+        // OpenCode has no on-disk session files; its rows come from the CLI scan.
+        if (provider == .opencode) return;
+
         var dir = std.fs.openDirAbsolute(root, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return,
             else => {
@@ -1403,6 +1507,19 @@ const LocalScan = struct {
         defer dir.close();
 
         try self.walkDir(provider, root, dir);
+    }
+
+    fn scanOpencodeCli(self: *LocalScan) !void {
+        const argv = [_][]const u8{ "opencode", "session", "list", "--format", "json" };
+        const bytes = runOpencodeCli(self.allocator, &argv, OPENCODE_LIST_MAX_BYTES) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OpencodeCliFailed => {
+                self.warning_count += 1;
+                return;
+            },
+        };
+        defer self.allocator.free(bytes);
+        try emitOpencodeSessionList(self.allocator, &self.emitter, &self.warning_count, bytes);
     }
 
     fn walkDir(self: *LocalScan, provider: types.ProviderId, abs_path: []const u8, dir: std.fs.Dir) !void {
@@ -1479,15 +1596,19 @@ const LocalScan = struct {
 
     fn scanCandidate(self: *LocalScan, candidate: Candidate) !void {
         const stamp: ai_history_cache.FileStamp = .{ .size = candidate.size, .mtime_ns = candidate.mtime };
-        if (self.cache) |cache| {
-            if (ai_history_cache.findRecord(cache, self.source.id, candidate.provider, candidate.path, stamp)) |record| {
-                const cached_meta = try cloneMetadata(self.allocator, record.meta);
-                {
-                    errdefer freeMetadata(self.allocator, cached_meta);
-                    try self.appendCacheRecord(candidate, record.meta);
+        // Kimi metadata also depends on state.json and session_index.jsonl, so a
+        // wire-only cache stamp cannot prove that its cached metadata is current.
+        if (candidate.provider != .kimi) {
+            if (self.cache) |cache| {
+                if (ai_history_cache.findRecord(cache, self.source.id, candidate.provider, candidate.path, stamp)) |record| {
+                    const cached_meta = try cloneMetadata(self.allocator, record.meta);
+                    {
+                        errdefer freeMetadata(self.allocator, cached_meta);
+                        try self.appendCacheRecord(candidate, record.meta);
+                    }
+                    try self.emitter.emit(cached_meta);
+                    return;
                 }
-                try self.emitter.emit(cached_meta);
-                return;
             }
         }
 
@@ -1511,7 +1632,9 @@ const LocalScan = struct {
         var meta = (switch (candidate.provider) {
             .codex => codex_provider.parseMetadata(self.allocator, candidate.path, bytes),
             .claude => claude_provider.parseMetadata(self.allocator, candidate.path, bytes),
-            .reasonix => self.parseReasonixMetadata(candidate, bytes),
+            .kimi => self.parseKimiMetadata(candidate, bytes),
+            // OpenCode rows come from scanOpencodeCli; file candidates never carry it.
+            .opencode => unreachable,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -1547,19 +1670,31 @@ const LocalScan = struct {
         try self.cache_records.append(self.allocator, cloned);
     }
 
-    fn parseReasonixMetadata(self: *LocalScan, candidate: Candidate, transcript_bytes: []const u8) !types.SessionMeta {
-        const meta_bytes = try self.readReasonixSidecar(candidate.path, ".meta.json");
-        defer self.allocator.free(meta_bytes);
-        const events_bytes = try self.readReasonixSidecar(candidate.path, ".events.jsonl");
-        defer self.allocator.free(events_bytes);
-        return try reasonix_provider.parseMetadata(self.allocator, candidate.path, transcript_bytes, meta_bytes, events_bytes);
+    fn parseKimiMetadata(self: *LocalScan, candidate: Candidate, transcript_bytes: []const u8) !types.SessionMeta {
+        const state_path = (try kimiStatePath(self.allocator, candidate.path)) orelse
+            return try kimi_provider.parseMetadata(self.allocator, candidate.path, transcript_bytes, "", "");
+        defer self.allocator.free(state_path);
+        const state_bytes = try self.readKimiFile(state_path);
+        defer self.allocator.free(state_bytes);
+        const index_bytes = try self.kimiIndex(candidate.path);
+        return try kimi_provider.parseMetadata(self.allocator, candidate.path, transcript_bytes, state_bytes, index_bytes);
     }
 
-    fn readReasonixSidecar(self: *LocalScan, source_path: []const u8, suffix: []const u8) ![]u8 {
-        const sidecar_path = try reasonixSidecarPath(self.allocator, source_path, suffix);
-        defer self.allocator.free(sidecar_path);
+    fn kimiIndex(self: *LocalScan, source_path: []const u8) ![]const u8 {
+        if (self.kimi_index) |bytes| return bytes;
+        const index_path = (try kimiIndexPath(self.allocator, source_path)) orelse {
+            const empty = try self.allocator.alloc(u8, 0);
+            self.kimi_index = empty;
+            return empty;
+        };
+        defer self.allocator.free(index_path);
+        const bytes = try self.readKimiFile(index_path);
+        self.kimi_index = bytes;
+        return bytes;
+    }
 
-        const file = std.fs.openFileAbsolute(sidecar_path, .{}) catch |err| switch (err) {
+    fn readKimiFile(self: *LocalScan, path: []const u8) ![]u8 {
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return try self.allocator.alloc(u8, 0),
             else => {
                 self.warning_count += 1;
@@ -1586,7 +1721,8 @@ fn providerRootForPath(source: source_mod.Source, provider: types.ProviderId, so
     const explicit = switch (provider) {
         .codex => source.codex_root_override,
         .claude => source.claude_root_override,
-        .reasonix => source.reasonix_root_override,
+        .kimi => source.kimi_root_override,
+        .opencode => source.opencode_root_override,
     };
     if (explicit) |root| return root;
     for (source.extra_roots) |root| {
@@ -1602,15 +1738,20 @@ const RemoteScan = struct {
     cache: ?ai_history_cache.CacheFile = null,
     emitter: RowEmitter,
     cache_records: std.ArrayListUnmanaged(ai_history_cache.CacheRecord) = .empty,
+    kimi_index: ?[]u8 = null,
     warning_count: u32 = 0,
 
     fn deinit(self: *RemoteScan) void {
         ai_history_cache.freeRecords(self.allocator, self.cache_records.items);
         self.cache_records.deinit(self.allocator);
         self.emitter.deinit();
+        if (self.kimi_index) |bytes| self.allocator.free(bytes);
     }
 
     fn scanProviderRoot(self: *RemoteScan, provider: types.ProviderId, root: []const u8) !void {
+        // OpenCode has no on-disk session files; its rows come from the CLI scan.
+        if (provider == .opencode) return;
+
         var find_buf: [2048]u8 = undefined;
         const find_cmd = providerFindCommand(provider, root, find_buf[0..]) catch {
             self.warning_count += 1;
@@ -1652,16 +1793,31 @@ const RemoteScan = struct {
         }
     }
 
+    fn scanOpencodeCli(self: *RemoteScan) !void {
+        const bytes = self.host.exec(self.host.ctx, self.allocator, OPENCODE_REMOTE_LIST_COMMAND) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.warning_count += 1;
+                return;
+            },
+        };
+        defer self.allocator.free(bytes);
+        try emitOpencodeSessionList(self.allocator, &self.emitter, &self.warning_count, bytes);
+    }
+
     fn scanPath(self: *RemoteScan, provider: types.ProviderId, path: []const u8, stamp: ai_history_cache.FileStamp) !void {
-        if (self.cache) |cache| {
-            if (ai_history_cache.findRecord(cache, self.source.id, provider, path, stamp)) |record| {
-                const cached_meta = try cloneMetadata(self.allocator, record.meta);
-                {
-                    errdefer freeMetadata(self.allocator, cached_meta);
-                    try self.appendCacheRecord(provider, path, stamp, record.meta);
+        // See LocalScan.scanCandidate: Kimi's sidecars must be merged again.
+        if (provider != .kimi) {
+            if (self.cache) |cache| {
+                if (ai_history_cache.findRecord(cache, self.source.id, provider, path, stamp)) |record| {
+                    const cached_meta = try cloneMetadata(self.allocator, record.meta);
+                    {
+                        errdefer freeMetadata(self.allocator, cached_meta);
+                        try self.appendCacheRecord(provider, path, stamp, record.meta);
+                    }
+                    try self.emitter.emit(cached_meta);
+                    return; // skipped the cat
                 }
-                try self.emitter.emit(cached_meta);
-                return; // skipped the cat
             }
         }
 
@@ -1692,7 +1848,9 @@ const RemoteScan = struct {
         var meta = (switch (provider) {
             .codex => codex_provider.parseMetadata(self.allocator, path, bytes),
             .claude => claude_provider.parseMetadata(self.allocator, path, bytes),
-            .reasonix => self.parseReasonixMetadata(path, bytes),
+            .kimi => self.parseKimiMetadata(path, bytes),
+            // OpenCode rows come from scanOpencodeCli; remote paths never carry it.
+            .opencode => unreachable,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -1728,19 +1886,32 @@ const RemoteScan = struct {
         try self.cache_records.append(self.allocator, cloned);
     }
 
-    fn parseReasonixMetadata(self: *RemoteScan, path: []const u8, transcript_bytes: []const u8) !types.SessionMeta {
-        const meta_bytes = try self.readReasonixSidecar(path, ".meta.json");
-        defer self.allocator.free(meta_bytes);
-        const events_bytes = try self.readReasonixSidecar(path, ".events.jsonl");
-        defer self.allocator.free(events_bytes);
-        return try reasonix_provider.parseMetadata(self.allocator, path, transcript_bytes, meta_bytes, events_bytes);
+    fn parseKimiMetadata(self: *RemoteScan, path: []const u8, transcript_bytes: []const u8) !types.SessionMeta {
+        const state_path = (try kimiStatePath(self.allocator, path)) orelse
+            return try kimi_provider.parseMetadata(self.allocator, path, transcript_bytes, "", "");
+        defer self.allocator.free(state_path);
+        const state_bytes = try self.readKimiFile(state_path);
+        defer self.allocator.free(state_bytes);
+        const index_bytes = try self.kimiIndex(path);
+        return try kimi_provider.parseMetadata(self.allocator, path, transcript_bytes, state_bytes, index_bytes);
     }
 
-    fn readReasonixSidecar(self: *RemoteScan, source_path: []const u8, suffix: []const u8) ![]u8 {
-        const sidecar_path = try reasonixSidecarPath(self.allocator, source_path, suffix);
-        defer self.allocator.free(sidecar_path);
+    fn kimiIndex(self: *RemoteScan, source_path: []const u8) ![]const u8 {
+        if (self.kimi_index) |bytes| return bytes;
+        const index_path = (try kimiIndexPath(self.allocator, source_path)) orelse {
+            const empty = try self.allocator.alloc(u8, 0);
+            self.kimi_index = empty;
+            return empty;
+        };
+        defer self.allocator.free(index_path);
+        const bytes = try self.readKimiFile(index_path);
+        self.kimi_index = bytes;
+        return bytes;
+    }
+
+    fn readKimiFile(self: *RemoteScan, path: []const u8) ![]u8 {
         var command_buf: [2048]u8 = undefined;
-        const command = remoteOptionalCatCommand(sidecar_path, &command_buf) catch {
+        const command = remoteOptionalCatCommand(path, &command_buf) catch {
             self.warning_count += 1;
             return try self.allocator.alloc(u8, 0);
         };
@@ -1758,7 +1929,8 @@ fn providerEnabled(source: source_mod.Source, provider: types.ProviderId) bool {
     return switch (provider) {
         .codex => source.providers.codex,
         .claude => source.providers.claude,
-        .reasonix => source.providers.reasonix,
+        .kimi => source.providers.kimi,
+        .opencode => source.providers.opencode,
     };
 }
 
@@ -1766,20 +1938,74 @@ fn providerAcceptsJsonl(provider: types.ProviderId, abs_dir: []const u8, name: [
     if (!std.mem.endsWith(u8, name, ".jsonl")) return false;
     return switch (provider) {
         .codex, .claude => true,
-        .reasonix => std.mem.eql(u8, std.fs.path.basename(abs_dir), "sessions") and
-            !std.mem.endsWith(u8, name, ".events.jsonl"),
+        .opencode => false,
+        .kimi => std.mem.eql(u8, name, "wire.jsonl") and
+            std.mem.eql(u8, std.fs.path.basename(abs_dir), "main") and
+            if (std.fs.path.dirname(abs_dir)) |parent|
+                std.mem.eql(u8, std.fs.path.basename(parent), "agents")
+            else
+                false,
     };
 }
 
-fn reasonixSidecarPath(allocator: std.mem.Allocator, source_path: []const u8, suffix: []const u8) ![]u8 {
-    const stem = if (std.mem.endsWith(u8, source_path, ".jsonl"))
-        source_path[0 .. source_path.len - ".jsonl".len]
-    else
-        source_path;
-    const path = try allocator.alloc(u8, stem.len + suffix.len);
-    @memcpy(path[0..stem.len], stem);
-    @memcpy(path[stem.len..], suffix);
-    return path;
+fn kimiStatePath(allocator: std.mem.Allocator, source_path: []const u8) !?[]u8 {
+    const posix_marker = "/agents/main/wire.jsonl";
+    if (std.mem.lastIndexOf(u8, source_path, posix_marker)) |index| {
+        return try std.fmt.allocPrint(allocator, "{s}/state.json", .{source_path[0..index]});
+    }
+    const windows_marker = "\\agents\\main\\wire.jsonl";
+    if (std.mem.lastIndexOf(u8, source_path, windows_marker)) |index| {
+        return try std.fmt.allocPrint(allocator, "{s}\\state.json", .{source_path[0..index]});
+    }
+    return null;
+}
+
+fn kimiIndexPath(allocator: std.mem.Allocator, source_path: []const u8) !?[]u8 {
+    const posix_marker = "/sessions/";
+    if (std.mem.lastIndexOf(u8, source_path, posix_marker)) |index| {
+        return try std.fmt.allocPrint(allocator, "{s}/session_index.jsonl", .{source_path[0..index]});
+    }
+    const windows_marker = "\\sessions\\";
+    if (std.mem.lastIndexOf(u8, source_path, windows_marker)) |index| {
+        return try std.fmt.allocPrint(allocator, "{s}\\session_index.jsonl", .{source_path[0..index]});
+    }
+    return null;
+}
+
+test "ai_history_session: Kimi related paths support POSIX and Windows" {
+    const allocator = std.testing.allocator;
+
+    const posix_source = "/home/user/.kimi-code/sessions/wd_demo/session_demo/agents/main/wire.jsonl";
+    const posix_state = (try kimiStatePath(allocator, posix_source)) orelse
+        return error.MissingKimiStatePath;
+    defer allocator.free(posix_state);
+    try std.testing.expectEqualStrings(
+        "/home/user/.kimi-code/sessions/wd_demo/session_demo/state.json",
+        posix_state,
+    );
+    const posix_index = (try kimiIndexPath(allocator, posix_source)) orelse
+        return error.MissingKimiIndexPath;
+    defer allocator.free(posix_index);
+    try std.testing.expectEqualStrings(
+        "/home/user/.kimi-code/session_index.jsonl",
+        posix_index,
+    );
+
+    const windows_source = "C:\\Users\\user\\.kimi-code\\sessions\\wd_demo\\session_demo\\agents\\main\\wire.jsonl";
+    const windows_state = (try kimiStatePath(allocator, windows_source)) orelse
+        return error.MissingKimiStatePath;
+    defer allocator.free(windows_state);
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\user\\.kimi-code\\sessions\\wd_demo\\session_demo\\state.json",
+        windows_state,
+    );
+    const windows_index = (try kimiIndexPath(allocator, windows_source)) orelse
+        return error.MissingKimiIndexPath;
+    defer allocator.free(windows_index);
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\user\\.kimi-code\\session_index.jsonl",
+        windows_index,
+    );
 }
 
 fn metadataHasUsableSignal(meta: types.SessionMeta) bool {
@@ -1846,7 +2072,8 @@ fn cloneSource(allocator: std.mem.Allocator, source: source_mod.Source) !source_
         .providers = source.providers,
         .codex_root_override = null,
         .claude_root_override = null,
-        .reasonix_root_override = null,
+        .kimi_root_override = null,
+        .opencode_root_override = null,
         .extra_roots = &.{},
     };
     errdefer freeOwnedSource(allocator, &cloned);
@@ -1860,7 +2087,8 @@ fn cloneSource(allocator: std.mem.Allocator, source: source_mod.Source) !source_
     };
     cloned.codex_root_override = try cloneOptionalSlice(allocator, source.codex_root_override);
     cloned.claude_root_override = try cloneOptionalSlice(allocator, source.claude_root_override);
-    cloned.reasonix_root_override = try cloneOptionalSlice(allocator, source.reasonix_root_override);
+    cloned.kimi_root_override = try cloneOptionalSlice(allocator, source.kimi_root_override);
+    cloned.opencode_root_override = try cloneOptionalSlice(allocator, source.opencode_root_override);
     cloned.extra_roots = try cloneProviderRoots(allocator, source.extra_roots);
 
     return cloned;
@@ -1909,7 +2137,8 @@ fn freeOwnedSource(allocator: std.mem.Allocator, source: *source_mod.Source) voi
     }
     if (source.codex_root_override) |value| freeSlice(allocator, value);
     if (source.claude_root_override) |value| freeSlice(allocator, value);
-    if (source.reasonix_root_override) |value| freeSlice(allocator, value);
+    if (source.kimi_root_override) |value| freeSlice(allocator, value);
+    if (source.opencode_root_override) |value| freeSlice(allocator, value);
     for (source.extra_roots) |root| {
         freeSlice(allocator, root.path);
     }
@@ -1947,9 +2176,9 @@ const TestTranscriptHost = struct {
 const FakeRemoteHost = struct {
     const codex_path = "/home/me/.codex/sessions/codex-abc.jsonl";
     const claude_path = "/home/me/.claude/projects/project/claude-abc.jsonl";
-    const reasonix_path = "/home/me/.reasonix/sessions/code-remote.jsonl";
-    const reasonix_meta_path = "/home/me/.reasonix/sessions/code-remote.meta.json";
-    const reasonix_events_path = "/home/me/.reasonix/sessions/code-remote.events.jsonl";
+    const kimi_path = "/home/me/.kimi-code/sessions/wd_project/session_remote/agents/main/wire.jsonl";
+    const kimi_state_path = "/home/me/.kimi-code/sessions/wd_project/session_remote/state.json";
+    const kimi_index_path = "/home/me/.kimi-code/session_index.jsonl";
     const codex_jsonl =
         \\{"type":"session_meta","id":"codex-abc","cwd":"/home/me/project","timestamp":"2026-05-31T10:00:00Z"}
         \\{"type":"response_item","role":"user","content":[{"type":"input_text","text":"Fix remote renderer"}],"timestamp":"2026-05-31T10:01:00Z"}
@@ -1959,17 +2188,24 @@ const FakeRemoteHost = struct {
         \\{"sessionId":"claude-abc","cwd":"/home/me/project","timestamp":"2026-05-31T10:00:00.000Z","type":"user","message":{"role":"user","content":"Fix remote tests"}}
         \\
     ;
-    const reasonix_jsonl =
-        \\{"role":"user","content":"remote reasonix"}
-        \\{"role":"assistant","content":"ok"}
+    const kimi_jsonl =
+        \\{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"remote kimi"}]},"time":1780221660000}
+        \\{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"ok"}},"time":1780221720000}
         \\
     ;
-    const reasonix_meta_json =
-        \\{"workspace":"/home/me/reasonix-project","summary":"Remote Reasonix","turnCount":1}
+    const kimi_state_json =
+        \\{"createdAt":"2026-05-31T10:00:00.000Z","updatedAt":"2026-05-31T10:02:00.000Z","title":"Remote Kimi","workDir":"/home/me/kimi-project"}
     ;
-    const reasonix_events_jsonl =
-        \\{"type":"session.opened","name":"code-remote","ts":"2026-05-31T10:00:00.000Z"}
-        \\{"type":"model.final","ts":"2026-05-31T10:01:00.000Z"}
+    const kimi_index_jsonl =
+        \\{"sessionId":"session_remote","workDir":"/home/me/kimi-project","sessionDir":"/home/me/.kimi-code/sessions/wd_project/session_remote"}
+        \\
+    ;
+    const opencode_list_json =
+        \\[{"id":"ses_remote1","title":"Remote OpenCode","created":1780221600000,"updated":1780221660000,"projectId":"global","directory":"/home/me/oc-project"}]
+        \\
+    ;
+    const opencode_export_json =
+        \\{"info":{"id":"ses_remote1"},"messages":[{"info":{"role":"user","time":{"created":1780221600000}},"parts":[{"type":"text","text":"remote opencode"}]}]}
         \\
     ;
 
@@ -1981,6 +2217,12 @@ const FakeRemoteHost = struct {
         if (std.mem.eql(u8, command, remote_file.wslHomeCommand())) {
             return try allocator.dupe(u8, "/home/me\n");
         }
+        if (std.mem.eql(u8, command, "opencode session list --format json 2>/dev/null")) {
+            return try allocator.dupe(u8, opencode_list_json);
+        }
+        if (std.mem.eql(u8, command, "opencode export 'ses_remote1' 2>/dev/null")) {
+            return try allocator.dupe(u8, opencode_export_json);
+        }
         if (std.mem.startsWith(u8, command, "find")) {
             // Emit "<mtime>\t<size>\t<path>" (the new -printf form) for the matching root.
             if (std.mem.indexOf(u8, command, "/home/me/.codex") != null) {
@@ -1989,8 +2231,8 @@ const FakeRemoteHost = struct {
             if (std.mem.indexOf(u8, command, "/home/me/.claude") != null) {
                 return try allocator.dupe(u8, "1700000001\t100\t" ++ claude_path ++ "\n");
             }
-            if (std.mem.indexOf(u8, command, "/home/me/.reasonix") != null) {
-                return try allocator.dupe(u8, "1700000002\t100\t" ++ reasonix_path ++ "\n");
+            if (std.mem.indexOf(u8, command, "/home/me/.kimi-code") != null) {
+                return try allocator.dupe(u8, "1700000002\t100\t" ++ kimi_path ++ "\n");
             }
             return try allocator.dupe(u8, "");
         }
@@ -2000,14 +2242,14 @@ const FakeRemoteHost = struct {
         if (std.mem.eql(u8, command, "cat '" ++ claude_path ++ "'")) {
             return try allocator.dupe(u8, claude_jsonl);
         }
-        if (std.mem.eql(u8, command, "cat '" ++ reasonix_path ++ "'")) {
-            return try allocator.dupe(u8, reasonix_jsonl);
+        if (std.mem.eql(u8, command, "cat '" ++ kimi_path ++ "'")) {
+            return try allocator.dupe(u8, kimi_jsonl);
         }
-        if (std.mem.eql(u8, command, "cat '" ++ reasonix_meta_path ++ "' 2>/dev/null || true")) {
-            return try allocator.dupe(u8, reasonix_meta_json);
+        if (std.mem.eql(u8, command, "cat '" ++ kimi_state_path ++ "' 2>/dev/null || true")) {
+            return try allocator.dupe(u8, kimi_state_json);
         }
-        if (std.mem.eql(u8, command, "cat '" ++ reasonix_events_path ++ "' 2>/dev/null || true")) {
-            return try allocator.dupe(u8, reasonix_events_jsonl);
+        if (std.mem.eql(u8, command, "cat '" ++ kimi_index_path ++ "' 2>/dev/null || true")) {
+            return try allocator.dupe(u8, kimi_index_jsonl);
         }
         return error.UnexpectedCommand;
     }
@@ -2068,7 +2310,7 @@ test "ai_history_session: initOwned clones source identity and ssh roots" {
     var profile_buf = [_]u8{ 'b', 'u', 'i', 'l', 'd', 'b', 'o', 'x' };
     var codex_buf = [_]u8{ '/', 't', 'm', 'p', '/', 'c', 'o', 'd', 'e', 'x' };
     var claude_buf = [_]u8{ '/', 't', 'm', 'p', '/', 'c', 'l', 'a', 'u', 'd', 'e' };
-    var reasonix_buf = [_]u8{ '/', 't', 'm', 'p', '/', 'r', 'e', 'a', 's', 'o', 'n', 'i', 'x' };
+    var kimi_buf = [_]u8{ '/', 't', 'm', 'p', '/', 'k', 'i', 'm', 'i' };
     var extra_path_buf = [_]u8{ '/', 't', 'm', 'p', '/', 'e', 'x', 't', 'r', 'a' };
     const extra_roots = [_]source_mod.ProviderRoot{
         .{ .provider = .codex, .path = extra_path_buf[0..] },
@@ -2080,7 +2322,7 @@ test "ai_history_session: initOwned clones source identity and ssh roots" {
         .target = .{ .ssh = .{ .profile_name = profile_buf[0..] } },
         .codex_root_override = codex_buf[0..],
         .claude_root_override = claude_buf[0..],
-        .reasonix_root_override = reasonix_buf[0..],
+        .kimi_root_override = kimi_buf[0..],
         .extra_roots = extra_roots[0..],
     });
     defer session.deinit();
@@ -2090,7 +2332,7 @@ test "ai_history_session: initOwned clones source identity and ssh roots" {
     @memset(&profile_buf, 'x');
     @memset(&codex_buf, 'x');
     @memset(&claude_buf, 'x');
-    @memset(&reasonix_buf, 'x');
+    @memset(&kimi_buf, 'x');
     @memset(&extra_path_buf, 'x');
 
     try std.testing.expectEqualStrings("ssh-history", session.source.id);
@@ -2098,13 +2340,13 @@ test "ai_history_session: initOwned clones source identity and ssh roots" {
     try std.testing.expectEqualStrings("buildbox", session.source.target.ssh.profile_name);
     try std.testing.expectEqualStrings("/tmp/codex", session.source.codex_root_override.?);
     try std.testing.expectEqualStrings("/tmp/claude", session.source.claude_root_override.?);
-    try std.testing.expectEqualStrings("/tmp/reasonix", session.source.reasonix_root_override.?);
+    try std.testing.expectEqualStrings("/tmp/kimi", session.source.kimi_root_override.?);
     try std.testing.expectEqual(@as(usize, 1), session.source.extra_roots.len);
     try std.testing.expectEqualStrings("/tmp/extra", session.source.extra_roots[0].path);
     try std.testing.expect(session.source.id.ptr != id_buf[0..].ptr);
     try std.testing.expect(session.source.name.ptr != name_buf[0..].ptr);
     try std.testing.expect(session.source.target.ssh.profile_name.ptr != profile_buf[0..].ptr);
-    try std.testing.expect(session.source.reasonix_root_override.?.ptr != reasonix_buf[0..].ptr);
+    try std.testing.expect(session.source.kimi_root_override.?.ptr != kimi_buf[0..].ptr);
     try std.testing.expect(session.source.extra_roots.ptr != extra_roots[0..].ptr);
     try std.testing.expect(session.source.extra_roots[0].path.ptr != extra_path_buf[0..].ptr);
 }
@@ -2300,17 +2542,42 @@ test "ai_history_session: remote scan uses fake host JSONL bytes" {
     }, fake.remoteExecHost());
     defer freeScanResult(allocator, result);
 
-    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 4), result.rows.len);
     try std.testing.expectEqual(@as(u32, 0), result.warning_count);
     try std.testing.expectEqual(types.ProviderId.codex, result.rows[0].provider);
     try std.testing.expectEqualStrings("codex-abc", result.rows[0].session_id);
     try std.testing.expectEqualStrings("/home/me/project", result.rows[0].project_dir);
     try std.testing.expectEqual(types.ProviderId.claude, result.rows[1].provider);
     try std.testing.expectEqualStrings("claude-abc", result.rows[1].session_id);
-    try std.testing.expectEqual(types.ProviderId.reasonix, result.rows[2].provider);
-    try std.testing.expectEqualStrings("code-remote", result.rows[2].session_id);
-    try std.testing.expectEqualStrings("/home/me/reasonix-project", result.rows[2].project_dir);
-    try std.testing.expectEqualStrings("Remote Reasonix", result.rows[2].summary);
+    try std.testing.expectEqual(types.ProviderId.kimi, result.rows[2].provider);
+    try std.testing.expectEqualStrings("session_remote", result.rows[2].session_id);
+    try std.testing.expectEqualStrings("/home/me/kimi-project", result.rows[2].project_dir);
+    try std.testing.expectEqualStrings("Remote Kimi", result.rows[2].summary);
+    try std.testing.expectEqual(types.ProviderId.opencode, result.rows[3].provider);
+    try std.testing.expectEqualStrings("ses_remote1", result.rows[3].session_id);
+    try std.testing.expectEqualStrings("Remote OpenCode", result.rows[3].title);
+    try std.testing.expectEqualStrings("/home/me/oc-project", result.rows[3].project_dir);
+    try std.testing.expectEqual(types.ResumeKind.opencode_resume, result.rows[3].resume_kind);
+    try std.testing.expectEqual(@as(i64, 1780221660000), result.rows[3].last_active_at_ms);
+}
+
+test "ai_history_session: remote opencode transcript loads through the CLI export command" {
+    const allocator = std.testing.allocator;
+    var fake = FakeRemoteHost{};
+    const meta: types.SessionMeta = .{
+        .provider = .opencode,
+        .session_id = "ses_remote1",
+        .title = "Remote OpenCode",
+        .project_dir = "/home/me/oc-project",
+        .source_path = "ses_remote1",
+        .resume_kind = .opencode_resume,
+    };
+    const messages = try loadRemoteTranscript(allocator, fake.remoteExecHost(), meta);
+    defer freeTranscript(allocator, .opencode, messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(types.MessageRole.user, messages[0].role);
+    try std.testing.expectEqualStrings("remote opencode", messages[0].content);
 }
 
 test "ai_history_session: remote scan keeps oversized codex metadata from prefix" {
@@ -2353,7 +2620,7 @@ test "ai_history_session: remote scan keeps oversized codex metadata from prefix
         .id = "wsl",
         .name = "WSL",
         .target = .{ .wsl = .{} },
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, host_state.host());
     defer freeScanResult(allocator, result);
 
@@ -2760,7 +3027,7 @@ test "ai_history_session: scanLocalFilesystem reads codex and claude jsonl files
 
     var home_buf: [std.fs.max_path_bytes]u8 = undefined;
     const home = try tmp.dir.realpath(".", &home_buf);
-    const result = try scanLocalFilesystem(allocator, .{ .id = "local", .name = "Local", .target = .local }, home);
+    const result = try scanLocalFilesystem(allocator, .{ .id = "local", .name = "Local", .target = .local, .providers = .{ .opencode = false } }, home);
     defer freeScanResult(allocator, result);
 
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
@@ -2771,7 +3038,8 @@ test "ai_history_session: scanLocalFilesystem reads codex and claude jsonl files
         switch (row.provider) {
             .codex => codex_count += 1,
             .claude => claude_count += 1,
-            .reasonix => {},
+            .kimi => {},
+            .opencode => {},
         }
     }
     try std.testing.expectEqual(@as(usize, 1), codex_count);
@@ -2802,7 +3070,7 @@ test "ai_history_session: scanLocalFilesystem keeps oversized codex metadata fro
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home);
     defer freeScanResult(allocator, result);
 
@@ -2813,62 +3081,80 @@ test "ai_history_session: scanLocalFilesystem keeps oversized codex metadata fro
     try std.testing.expectEqual(@as(u32, 1), result.warning_count);
 }
 
-test "ai_history_session: scanLocalFilesystem reads reasonix sessions with sidecars" {
+test "ai_history_session: scanLocalFilesystem reads Kimi wire and state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".reasonix/sessions");
+    try tmp.dir.makePath(".kimi-code/sessions/wd_demo/session_demo/agents/main");
     try tmp.dir.writeFile(.{
-        .sub_path = ".reasonix/sessions/code-demo.jsonl",
+        .sub_path = ".kimi-code/sessions/wd_demo/session_demo/agents/main/wire.jsonl",
         .data =
-        \\{"role":"user","content":"hello"}
-        \\{"role":"assistant","content":"Hi"}
+        \\{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"time":1779803614400}
+        \\{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Hi"}},"time":1779803699393}
         \\
         ,
     });
     try tmp.dir.writeFile(.{
-        .sub_path = ".reasonix/sessions/code-demo.meta.json",
+        .sub_path = ".kimi-code/sessions/wd_demo/session_demo/state.json",
         .data =
-        \\{"workspace":"/tmp/reasonix-project","summary":"Reasonix summary","turnCount":1}
+        \\{"createdAt":"2026-05-26T13:53:34.400Z","updatedAt":"2026-05-26T13:54:59.393Z","title":"Kimi summary","workDir":"/tmp/kimi-project"}
         ,
     });
     try tmp.dir.writeFile(.{
-        .sub_path = ".reasonix/sessions/code-demo.events.jsonl",
+        .sub_path = ".kimi-code/session_index.jsonl",
         .data =
-        \\{"type":"session.opened","name":"code-demo","ts":"2026-05-26T13:53:34.400Z"}
-        \\{"type":"model.final","ts":"2026-05-26T13:54:59.393Z"}
+        \\{"sessionId":"session_demo","workDir":"/tmp/kimi-project","sessionDir":"/tmp/.kimi-code/sessions/wd_demo/session_demo"}
         \\
         ,
     });
+    try tmp.dir.makePath(".kimi-code/user-history");
     try tmp.dir.writeFile(.{
-        .sub_path = ".reasonix/usage.jsonl",
+        .sub_path = ".kimi-code/user-history/ignored.jsonl",
         .data =
-        \\{"not":"a session"}
+        \\{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"not a session"}]}}
         ,
     });
 
     var home_buf: [std.fs.max_path_bytes]u8 = undefined;
     const home = try tmp.dir.realpath(".", &home_buf);
-    const result = try scanLocalFilesystem(allocator, .{
+    const source: source_mod.Source = .{
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = false, .claude = false, .reasonix = true },
-    }, home);
+        .providers = .{ .codex = false, .claude = false, .kimi = true, .opencode = false },
+    };
+    const result = try scanLocalFilesystem(allocator, source, home);
     defer freeScanResult(allocator, result);
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(u32, 0), result.warning_count);
     const row = result.rows[0];
-    try std.testing.expectEqual(types.ProviderId.reasonix, row.provider);
-    try std.testing.expectEqualStrings("code-demo", row.session_id);
-    try std.testing.expectEqualStrings("Reasonix summary", row.title);
-    try std.testing.expectEqualStrings("Reasonix summary", row.summary);
-    try std.testing.expectEqualStrings("/tmp/reasonix-project", row.project_dir);
-    try std.testing.expectEqual(types.ResumeKind.reasonix_resume, row.resume_kind);
+    try std.testing.expectEqual(types.ProviderId.kimi, row.provider);
+    try std.testing.expectEqualStrings("session_demo", row.session_id);
+    try std.testing.expectEqualStrings("Kimi summary", row.title);
+    try std.testing.expectEqualStrings("Kimi summary", row.summary);
+    try std.testing.expectEqualStrings("/tmp/kimi-project", row.project_dir);
+    try std.testing.expectEqual(types.ResumeKind.kimi_resume, row.resume_kind);
     try std.testing.expectEqual(@as(u32, 2), row.message_count);
     try std.testing.expect(row.last_active_at_ms > row.created_at_ms);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = ".kimi-code/sessions/wd_demo/session_demo/state.json",
+        .data =
+        \\{"createdAt":"2026-05-26T13:53:34.400Z","updatedAt":"2026-05-26T13:55:59.393Z","title":"Updated Kimi title","workDir":"/tmp/kimi-project"}
+        ,
+    });
+    const refreshed = try scanLocalFilesystemWithCache(
+        allocator,
+        source,
+        home,
+        .{},
+        .{ .records = result.cache_update.records },
+    );
+    defer freeScanResult(allocator, refreshed);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.rows.len);
+    try std.testing.expectEqualStrings("Updated Kimi title", refreshed.rows[0].title);
 }
 
 test "ai_history_session: scanNow failure marks failed and preserves existing rows" {
@@ -2929,7 +3215,7 @@ test "ai_history_session: scanLocalFilesystem skips unusable metadata with warni
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home);
     defer freeScanResult(allocator, result);
 
@@ -2962,7 +3248,7 @@ test "ai_history_session: scanLocalFilesystem budget returns partial rows with w
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home, .{ .max_files = 1, .max_bytes = 1024 * 1024 });
     defer freeScanResult(allocator, result);
 
@@ -3001,7 +3287,7 @@ test "ai_history_session: scanLocalFilesystem reuses unchanged cached metadata" 
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home, .{}, null);
     defer freeScanResult(allocator, first);
     try std.testing.expectEqual(@as(usize, 1), first.cache_update.records.len);
@@ -3020,7 +3306,7 @@ test "ai_history_session: scanLocalFilesystem reuses unchanged cached metadata" 
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home, .{}, .{ .records = @constCast(&records) });
     defer freeScanResult(allocator, result);
 
@@ -3106,7 +3392,9 @@ test "ai_history_session: cycleCategory wraps forward and backward" {
     session.cycleCategory(1);
     try std.testing.expectEqual(types.CategoryFilter.claude, session.category);
     session.cycleCategory(1);
-    try std.testing.expectEqual(types.CategoryFilter.reasonix, session.category);
+    try std.testing.expectEqual(types.CategoryFilter.kimi, session.category);
+    session.cycleCategory(1);
+    try std.testing.expectEqual(types.CategoryFilter.opencode, session.category);
     session.cycleCategory(1);
     try std.testing.expectEqual(types.CategoryFilter.subagent, session.category);
     session.cycleCategory(1);
@@ -3428,20 +3716,22 @@ test "ai_history_session: moveFilterCursor walks categories then dates, applying
     const rows = [_]types.SessionMeta{
         .{ .provider = .codex, .session_id = "a", .title = "A", .source_path = "a.jsonl", .resume_kind = .codex_resume, .last_active_at_ms = day2 },
         .{ .provider = .claude, .session_id = "b", .title = "B", .source_path = "b.jsonl", .resume_kind = .claude_resume, .last_active_at_ms = day1 },
-        .{ .provider = .reasonix, .session_id = "c", .title = "C", .source_path = "c.jsonl", .resume_kind = .reasonix_resume, .last_active_at_ms = day2 },
+        .{ .provider = .kimi, .session_id = "c", .title = "C", .source_path = "c.jsonl", .resume_kind = .kimi_resume, .last_active_at_ms = day2 },
     };
     try session.replaceRows(&rows);
 
-    // Combined list: All, Codex, Claude, Reasonix, Subagent, All dates, 20260602, 20260601 => 8 rows.
-    try std.testing.expectEqual(@as(usize, 8), session.filterRowCount());
+    // Combined list: All, Codex, Claude, Kimi, OpenCode, Subagent, All dates, 20260602, 20260601 => 9 rows.
+    try std.testing.expectEqual(@as(usize, 9), session.filterRowCount());
     try std.testing.expectEqual(types.CategoryFilter.all, session.category);
 
     session.moveFilterCursor(1); // -> Codex
     try std.testing.expectEqual(types.CategoryFilter.codex, session.category);
     session.moveFilterCursor(1); // -> Claude
     try std.testing.expectEqual(types.CategoryFilter.claude, session.category);
-    session.moveFilterCursor(1); // -> Reasonix
-    try std.testing.expectEqual(types.CategoryFilter.reasonix, session.category);
+    session.moveFilterCursor(1); // -> Kimi
+    try std.testing.expectEqual(types.CategoryFilter.kimi, session.category);
+    session.moveFilterCursor(1); // -> OpenCode
+    try std.testing.expectEqual(types.CategoryFilter.opencode, session.category);
     session.moveFilterCursor(1); // -> Subagent
     try std.testing.expectEqual(types.CategoryFilter.subagent, session.category);
     session.moveFilterCursor(1); // -> All dates (date filter cleared, category kept)
@@ -3702,7 +3992,7 @@ test "ai_history_session: local scan with sink streams rows and returns empty no
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home, .{}, null, collect.sink());
     defer freeScanResult(allocator, result);
 
@@ -3725,7 +4015,7 @@ test "ai_history_session: remote scan with sink streams rows and returns empty n
         .id = "wsl",
         .name = "WSL",
         .target = .{ .wsl = .{} },
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, host, null, collect.sink());
     defer freeScanResult(allocator, result);
 
@@ -3827,7 +4117,7 @@ test "ai_history_session: local scan warm cache publishes provisional batch then
         .id = "local",
         .name = "Local",
         .target = .local,
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, home, .{}, cache, collect.sink());
     defer freeScanResult(allocator, result);
 
@@ -3847,13 +4137,17 @@ test "ai_history_session: providerFindCommand emits sorted mtime/size/path" {
     try std.testing.expect(std.mem.indexOf(u8, cmd, "sort -rn") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "'/home/me/.codex'") != null);
 
-    const reasonix_cmd = try providerFindCommand(.reasonix, "/home/me/.reasonix", &buf);
-    try std.testing.expect(std.mem.indexOf(u8, reasonix_cmd, "'/home/me/.reasonix/sessions'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reasonix_cmd, "! -name '*.events.jsonl'") != null);
+    const kimi_cmd = try providerFindCommand(.kimi, "/home/me/.kimi-code", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_cmd, "'/home/me/.kimi-code/sessions'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_cmd, "-path '*/agents/main/wire.jsonl'") != null);
 
-    const reasonix_sessions_cmd = try providerFindCommand(.reasonix, "/home/me/.reasonix/sessions", &buf);
-    try std.testing.expect(std.mem.indexOf(u8, reasonix_sessions_cmd, "'/home/me/.reasonix/sessions/sessions'") == null);
-    try std.testing.expect(std.mem.indexOf(u8, reasonix_sessions_cmd, "'/home/me/.reasonix/sessions'") != null);
+    const kimi_sessions_cmd = try providerFindCommand(.kimi, "/home/me/.kimi-code/sessions", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_sessions_cmd, "'/home/me/.kimi-code/sessions/sessions'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_sessions_cmd, "'/home/me/.kimi-code/sessions'") != null);
+
+    const kimi_trailing_slash_cmd = try providerFindCommand(.kimi, "/home/me/.kimi-code/sessions/", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_trailing_slash_cmd, "'/home/me/.kimi-code/sessions'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_trailing_slash_cmd, "sessions/sessions") == null);
 }
 
 test "ai_history_session: parseRemoteStamp parses tab fields and tolerates plain paths" {
@@ -3897,7 +4191,7 @@ test "ai_history_session: remote scan skips cat on cache hit" {
         .id = "wsl",
         .name = "WSL",
         .target = .{ .wsl = .{} },
-        .providers = .{ .codex = true, .claude = false, .reasonix = false },
+        .providers = .{ .codex = true, .claude = false, .kimi = false, .opencode = false },
     }, host, cache, null);
     defer freeScanResult(allocator, result);
 

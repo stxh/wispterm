@@ -249,7 +249,8 @@ fn sanitizedProviderLabel(provider: types.ProviderId) []const u8 {
     return switch (provider) {
         .codex => "codex",
         .claude => "claude-code",
-        .reasonix => "reasonix",
+        .kimi => "kimi",
+        .opencode => "opencode",
     };
 }
 
@@ -368,11 +369,11 @@ test "ai history markdown export collapses metadata whitespace to one line" {
 test "ai history copilot context truncates oversized transcripts from the front" {
     const allocator = std.testing.allocator;
     const meta = types.SessionMeta{
-        .provider = .reasonix,
+        .provider = .kimi,
         .session_id = "sess-3",
         .title = "Long chat",
-        .source_path = "/home/me/.reasonix/sessions/events.jsonl",
-        .resume_kind = .reasonix_resume,
+        .source_path = "/home/me/.kimi-code/sessions/events.jsonl",
+        .resume_kind = .kimi_resume,
     };
     const messages = [_]types.TranscriptMessage{
         .{ .role = .user, .content = "old prompt that should drop" },
@@ -394,11 +395,11 @@ test "ai history copilot context truncates oversized transcripts from the front"
 test "ai history copilot context stays bounded when metadata alone is too large" {
     const allocator = std.testing.allocator;
     const meta = types.SessionMeta{
-        .provider = .reasonix,
+        .provider = .kimi,
         .session_id = "sess-" ++ ("x" ** 140),
         .title = "Long " ++ ("y" ** 140),
-        .source_path = "/home/me/.reasonix/sessions/" ++ ("z" ** 140) ++ ".jsonl",
-        .resume_kind = .reasonix_resume,
+        .source_path = "/home/me/.kimi-code/sessions/" ++ ("z" ** 140) ++ ".jsonl",
+        .resume_kind = .kimi_resume,
     };
     const messages = [_]types.TranscriptMessage{
         .{ .role = .assistant, .content = "recent answer" },
@@ -515,15 +516,15 @@ test "ai history raw download filename treats windows separators as basename" {
 test "ai history raw download filename preserves long session and basename" {
     var buf: [512]u8 = undefined;
     const meta = types.SessionMeta{
-        .provider = .reasonix,
+        .provider = .kimi,
         .session_id = "session:" ++ ("A" ** 220) ++ "/tail",
         .title = "Ignored",
-        .source_path = "/home/me/.reasonix/sessions/original " ++ ("B" ** 80) ++ ".jsonl",
-        .resume_kind = .reasonix_resume,
+        .source_path = "/home/me/.kimi-code/sessions/original " ++ ("B" ** 80) ++ ".jsonl",
+        .resume_kind = .kimi_resume,
     };
 
     const name = rawDownloadFilename(meta, &buf);
-    try std.testing.expect(std.mem.startsWith(u8, name, "reasonix-session-"));
+    try std.testing.expect(std.mem.startsWith(u8, name, "kimi-session-"));
     try std.testing.expect(std.mem.indexOf(u8, name, "tail-original") != null);
     try std.testing.expect(std.mem.endsWith(u8, name, ".jsonl"));
 }
@@ -531,15 +532,15 @@ test "ai history raw download filename preserves long session and basename" {
 test "ai history raw download filename reserves basename in integration buffer" {
     var buf: [180]u8 = undefined;
     const meta = types.SessionMeta{
-        .provider = .reasonix,
+        .provider = .kimi,
         .session_id = "session-" ++ ("A" ** 220),
         .title = "Ignored",
-        .source_path = "/home/me/.reasonix/sessions/original file.jsonl",
-        .resume_kind = .reasonix_resume,
+        .source_path = "/home/me/.kimi-code/sessions/original file.jsonl",
+        .resume_kind = .kimi_resume,
     };
 
     const name = rawDownloadFilename(meta, &buf);
-    try std.testing.expect(std.mem.startsWith(u8, name, "reasonix-session-"));
+    try std.testing.expect(std.mem.startsWith(u8, name, "kimi-session-"));
     try std.testing.expect(std.mem.indexOf(u8, name, "original-file") != null);
     try std.testing.expect(std.mem.endsWith(u8, name, ".jsonl"));
 }
