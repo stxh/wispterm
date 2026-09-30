@@ -30,6 +30,7 @@ pub const Command = union(enum) {
     toggle_maximize,
     font_size: i32,
     open_settings,
+    toggle_mouse_reporting,
     // Late commands.
     copy,
     paste,
@@ -64,6 +65,7 @@ pub fn resolve(action: keybind.Action, phase: Phase) ?Command {
             .font_size_increase => .{ .font_size = 1 },
             .font_size_decrease => .{ .font_size = -1 },
             .open_settings => .open_settings,
+            .toggle_mouse_reporting => .toggle_mouse_reporting,
             else => null,
         },
         .late => switch (action) {
@@ -223,4 +225,22 @@ test "copilot_conversation_picker is a real, default-bound keybind action" {
         }
     }
     try std.testing.expect(bound);
+}
+
+// `toggle_mouse_reporting` is the escape hatch for a TUI that enabled mouse
+// tracking and exited without the matching DECRST. It must be expressible in
+// `keybind = ...` config, resolvable as a command, and — like Ghostty's action
+// and `send_to_copilot` — carry no default chord so it cannot steal a key a
+// TUI needs. Discoverability comes from the command-center entry instead.
+test "toggle_mouse_reporting is bindable but has no default chord" {
+    try std.testing.expectEqual(
+        keybind.Action.toggle_mouse_reporting,
+        keybind.Action.parse("toggle_mouse_reporting").?,
+    );
+    try std.testing.expectEqual(Command.toggle_mouse_reporting, resolve(.toggle_mouse_reporting, .early).?);
+    try std.testing.expectEqual(@as(?Command, null), resolve(.toggle_mouse_reporting, .late));
+
+    for (keybind.default_bindings) |binding| {
+        try std.testing.expect(binding.action != .toggle_mouse_reporting);
+    }
 }

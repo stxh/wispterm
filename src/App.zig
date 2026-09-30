@@ -84,6 +84,7 @@ debug_memory: bool,
 unfocused_split_opacity: f32,
 split_divider_color: ?Config.Color,
 focus_follows_mouse: bool,
+mouse_reporting: bool,
 copy_on_select: bool,
 right_click_action: Config.RightClickAction,
 url_open_mode: Config.UrlOpenMode,
@@ -279,6 +280,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .unfocused_split_opacity = cfg.@"unfocused-split-opacity",
         .split_divider_color = cfg.@"split-divider-color",
         .focus_follows_mouse = cfg.@"focus-follows-mouse",
+        .mouse_reporting = cfg.@"mouse-reporting",
         .copy_on_select = cfg.@"copy-on-select",
         .right_click_action = cfg.@"right-click-action",
         .url_open_mode = cfg.@"url-open-mode",
@@ -571,6 +573,7 @@ pub fn updateConfig(self: *App, cfg: *const Config) void {
     self.unfocused_split_opacity = cfg.@"unfocused-split-opacity";
     self.split_divider_color = cfg.@"split-divider-color";
     self.focus_follows_mouse = cfg.@"focus-follows-mouse";
+    self.mouse_reporting = cfg.@"mouse-reporting";
     self.copy_on_select = cfg.@"copy-on-select";
     self.right_click_action = cfg.@"right-click-action";
     self.url_open_mode = cfg.@"url-open-mode";

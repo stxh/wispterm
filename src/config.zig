@@ -463,6 +463,18 @@ language: i18n.LanguageSetting = .auto,
 /// When true, moving the mouse into a split pane focuses it.
 @"focus-follows-mouse": bool = false,
 
+/// When true, honor a focused program's DECSET mouse-tracking request
+/// (?9/?1000/?1002/?1003) and forward its mouse events to the PTY. When false
+/// the terminal always keeps the mouse for local selection / scrollback /
+/// clipboard. Matches Ghostty's `mouse-reporting`.
+///
+/// This is the escape hatch for a TUI that enables mouse tracking and then
+/// exits without emitting the matching DECRST: the flag lives in the VT state
+/// and nothing clears it on program exit, so the terminal would otherwise keep
+/// forwarding clicks into a process that no longer reads them. Shift-drag
+/// always selects locally regardless of this key.
+@"mouse-reporting": bool = true,
+
 /// When true, persist tab/split layout to the platform config directory on
 /// close, and restore it on next launch (unless CLI args specify otherwise).
 /// Default false: the file is neither written nor read when this is off.
@@ -1110,6 +1122,14 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             self.@"focus-follows-mouse" = false;
         } else {
             log.warn("invalid focus-follows-mouse: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "mouse-reporting")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"mouse-reporting" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"mouse-reporting" = false;
+        } else {
+            log.warn("invalid mouse-reporting: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "restore-tabs-on-startup")) {
         if (std.mem.eql(u8, value, "true")) {
@@ -1910,6 +1930,10 @@ const default_config_template =
     \\# copy-on-select = false
     \\# right-click-action = copy   # ignore | copy | paste | copy-or-paste
     \\# url-open-mode = embedded    # embedded | system-browser
+    \\# Forward mouse events to a TUI that requested mouse tracking (?1000 etc).
+    \\# Set false to always keep the mouse local. Also toggled at runtime with
+    \\# the toggle_mouse_reporting action.
+    \\# mouse-reporting = true
     \\
     \\# UI language (auto follows the system locale; restart required)
     \\# language = auto             # auto | en | zh-CN

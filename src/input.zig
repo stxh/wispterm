@@ -1,4 +1,4 @@
-﻿//! Input handling for AppWindow.
+//! Input handling for AppWindow.
 //!
 //! Processes platform input events (keyboard, mouse, resize) and dispatches
 //! to appropriate handlers. Manages clipboard, selection, scrollbar dragging,
@@ -2196,6 +2196,17 @@ fn blurBrowserUrlBarIfFocused() void {
     markBrowserUrlBarDirty();
 }
 
+/// Drop any in-progress terminal mouse report (the cached reported-drag
+/// pointer + button). Every state-reset path must call this: the report state
+/// holds a raw `*Surface`, so leaving it set after the surface is torn down
+/// makes the next mouse-move lock freed memory, and leaving it set while the
+/// surface lives makes `handleMouseMove` suppress local hover and drag-selection
+/// forever. Pairs with `cancelTransientMouseState` / `clearUiStateOnTabChange` /
+/// `sweepExitedSurfaces`.
+pub fn cancelTerminalMouseReport() void {
+    g_mouse_report.clear();
+}
+
 pub fn cancelTransientMouseState(win: anytype) void {
     g_divider_hover = false;
     g_divider_dragging = false;
@@ -2228,6 +2239,10 @@ pub fn cancelTransientMouseState(win: anytype) void {
     g_ai_transcript_select_chat = null;
     g_ai_transcript_select_auto_copy = false;
     g_ai_transcript_select_panel = .active_chat;
+    // Must run BEFORE clearTransientInput below: that call throws away the
+    // platform's queued button events, so a held reported press would lose its
+    // release and leave the drag active (and its *Surface dangling) forever.
+    cancelTerminalMouseReport();
     window_backend.clearTransientInput(win);
 }
 
@@ -3123,6 +3138,7 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         .toggle_maximize => toggleMaximize(),
         .font_size => |delta| adjustFontSize(delta),
         .open_settings => overlays.settingsPageOpen(),
+        .toggle_mouse_reporting => AppWindow.toggleMouseReporting(),
         // Late
         .copy => copySelectionToClipboard(),
         .send_to_copilot => _ = AppWindow.sendSelectionToCopilot(),
@@ -3910,7 +3926,21 @@ fn isModifierKey(key_code: platform_input.KeyCode) bool {
         key_code == platform_input.key_right_alt;
 }
 
+/// True when the AI-chat composer owns this key outright.
+///
+/// Modifier chords deliberately fall through. The copilot sidebar overlays a
+/// LIVE terminal, so Ctrl/Alt/Super + navigation (Ctrl+Right, Ctrl+Home,
+/// Alt+Up, Shift+PageUp …) belongs to the terminal or the running TUI, not to
+/// the composer. The composer's own Ctrl bindings (select-all / clear-input /
+/// cut) are claimed by the explicit arms that run *before* every isAiChatKey
+/// call site, so nothing that used to work regresses. Shift stays allowed:
+/// Shift+Tab / Shift+Enter are real composer chords.
+///
+/// This is the same rule the focused-preview-pane branch applies below
+/// (`!ev.ctrl and !ev.shift and !ev.alt and !ev.super`), generalized to allow
+/// Shift for the composer's own chords.
 fn isAiChatKey(ev: platform_input.KeyEvent) bool {
+    if (ev.ctrl or ev.alt or ev.super) return false;
     if (ev.key_code == platform_input.key_enter or
         ev.key_code == platform_input.key_backspace or
         ev.key_code == platform_input.key_delete or
@@ -3922,8 +3952,91 @@ fn isAiChatKey(ev: platform_input.KeyEvent) bool {
         ev.key_code == platform_input.key_end or
         ev.key_code == platform_input.key_tab or
         ev.key_code == platform_input.key_escape) return true;
-    if (ev.ctrl and !ev.alt and (ev.key_code == 0x41 or ev.key_code == 0x55 or ev.key_code == 0x4C)) return true; // Ctrl+A / Ctrl+U / Ctrl+L
     return false;
+}
+
+// Regression: the copilot sidebar overlays a LIVE terminal, and isAiChatKey
+// used to claim every arrow/Home/End/Tab regardless of modifiers — so
+// Ctrl+Right (and Ctrl+Left, Ctrl+Home, Alt+Up …) were swallowed by the
+// composer instead of reaching the terminal as \x1b[1;5C.
+test "input: AI chat composer yields modifier chords to the terminal" {
+    try skipUnlessInputRendererShard();
+    const chord = struct {
+        fn ev(key_code: platform_input.KeyCode, ctrl: bool, alt: bool, sup: bool) platform_input.KeyEvent {
+            return .{ .key_code = key_code, .ctrl = ctrl, .shift = false, .alt = alt, .super = sup };
+        }
+    }.ev;
+
+    inline for (.{
+        chord(platform_input.key_right, true, false, false),
+        chord(platform_input.key_left, true, false, false),
+        chord(platform_input.key_up, true, false, false),
+        chord(platform_input.key_down, true, false, false),
+        chord(platform_input.key_home, true, false, false),
+        chord(platform_input.key_end, true, false, false),
+        chord(platform_input.key_delete, true, false, false),
+        chord(platform_input.key_up, false, true, false),
+        chord(platform_input.key_up, false, false, true),
+    }) |ev| {
+        try std.testing.expect(!isAiChatKey(ev));
+    }
+
+    // Plain editing keys still belong to the composer…
+    inline for (.{
+        platform_input.key_left,
+        platform_input.key_right,
+        platform_input.key_up,
+        platform_input.key_down,
+        platform_input.key_home,
+        platform_input.key_end,
+        platform_input.key_enter,
+        platform_input.key_backspace,
+        platform_input.key_delete,
+        platform_input.key_tab,
+        platform_input.key_escape,
+    }) |key_code| {
+        try std.testing.expect(isAiChatKey(chord(key_code, false, false, false)));
+    }
+
+    // …and Shift stays available for the composer's own chords.
+    var shift_tab = chord(platform_input.key_tab, false, false, false);
+    shift_tab.shift = true;
+    try std.testing.expect(isAiChatKey(shift_tab));
+}
+
+// Regression: the file explorer / agent-history panel sits over a live
+// terminal, so its navigation arms must only claim the plain chord — otherwise
+// Ctrl+Up / Ctrl+Down / Ctrl+Delete are eaten while a TUI is running.
+test "input: file explorer and agent history yield modifier chords" {
+    try skipUnlessInputRendererShard();
+    try std.testing.expect(!handleFileExplorerKey(.{
+        .key_code = platform_input.key_up,
+        .ctrl = true,
+        .shift = false,
+        .alt = false,
+        .super = false,
+    }));
+    try std.testing.expect(!handleFileExplorerKey(.{
+        .key_code = platform_input.key_down,
+        .ctrl = true,
+        .shift = false,
+        .alt = false,
+        .super = false,
+    }));
+    try std.testing.expect(!handleAgentHistoryKey(.{
+        .key_code = platform_input.key_up,
+        .ctrl = true,
+        .shift = false,
+        .alt = false,
+        .super = false,
+    }));
+    try std.testing.expect(!handleAgentHistoryKey(.{
+        .key_code = platform_input.key_delete,
+        .ctrl = true,
+        .shift = false,
+        .alt = false,
+        .super = false,
+    }));
 }
 
 fn aiChatInputWrapCols() usize {
@@ -4341,6 +4454,11 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
             return true;
         },
         key_up, key_down, key_enter => {
+            // Only claim the PLAIN chord. Ctrl/Alt/Super + navigation belongs
+            // to the terminal behind the panel (Ctrl+Up/Down are real terminal
+            // and TUI keys), and the file explorer is a panel over a live
+            // terminal, not a modal page. Shift stays allowed.
+            if (ev.ctrl or ev.alt or ev.super) return false;
             // Navigation keys route through a domain-owned action so this branch
             // asks file_explorer to perform the intent instead of calling its
             // internals directly. fromNavigationKey owns exactly these keys.
@@ -4385,6 +4503,10 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
 }
 
 fn handleAgentHistoryKey(ev: platform_input.KeyEvent) bool {
+    // Same rule as handleFileExplorerKey: the agent-history list is a panel over
+    // a live terminal, so only the plain chord is ours. Ctrl/Alt/Super +
+    // navigation (Ctrl+Up/Down, Ctrl+Delete …) falls through to the terminal.
+    if (ev.ctrl or ev.alt or ev.super) return false;
     switch (ev.key_code) {
         platform_input.key_escape => {
             file_explorer.blur();
@@ -6650,6 +6772,8 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
         return;
     }
 
+    updateMouseCaptureCursor(ev.x, ev.y);
+
     if (AppWindow.g_window) |hover_win| {
         if (AppWindow.activeAiChat()) |chat| {
             const hover_fb = window_backend.framebufferSize(hover_win);
@@ -6894,7 +7018,9 @@ fn mouseWheelUnits(delta: i16) usize {
 }
 
 fn appendMouseWheelReport(surface: *Surface, ev: platform_input.MouseWheelEvent, out: *[512]u8, len: *usize) bool {
-    if (surface.terminal.flags.mouse_event == .none or surface.terminal.flags.mouse_event == .x10) return false;
+    // Caller holds the render lock (the wheel dispatch decides under it).
+    if (!mouseReportingActiveLocked(surface)) return false;
+    if (surface.terminal.flags.mouse_event == .x10) return false;
 
     var button_code: u8 = if (ev.delta > 0) 64 else 65; // xterm wheel up/down buttons 4/5
     if (ev.shift) button_code += 4;
@@ -6925,7 +7051,10 @@ fn appendMouseWheelReport(surface: *Surface, ev: platform_input.MouseWheelEvent,
 
 fn appendAlternateScrollKeys(surface: *Surface, ev: platform_input.MouseWheelEvent, out: *[512]u8, len: *usize) bool {
     if (surface.terminal.screens.active_key != .alternate) return false;
-    if (surface.terminal.flags.mouse_event != .none) return false;
+    // Stands down whenever the terminal would otherwise forward the wheel. Uses
+    // the reporting gate (not the raw VT flag) so a stale mouse_event left by a
+    // TUI that exited without DECRST can't suppress ?1007 alternate scroll.
+    if (mouseReportingActiveLocked(surface)) return false;
     if (!surface.terminal.modes.get(.mouse_alternate_scroll)) return false;
 
     const seq = if (surface.terminal.modes.get(.cursor_keys))
@@ -6976,6 +7105,21 @@ fn platformMouseButton(button: platform_input.MouseButton) mouse_report.Button {
     };
 }
 
+/// Same question as `mouse_dispatch.reportingActive` but for a whole surface,
+/// reading the VT flag under the render lock. Use `mouseReportingActiveLocked`
+/// when the caller already holds it.
+fn surfaceMouseReportingActive(surface: *Surface) bool {
+    surface.render_state.mutex.lock();
+    defer surface.render_state.mutex.unlock();
+    return mouseReportingActiveLocked(surface);
+}
+
+/// `surfaceMouseReportingActive` for callers that already hold the render lock
+/// (the wheel dispatch runs its whole decision tree under it).
+fn mouseReportingActiveLocked(surface: *Surface) bool {
+    return mouse_dispatch.reporting.active(mouseReportEvent(surface.terminal.flags.mouse_event));
+}
+
 /// Encode and deliver one mouse button/motion event to the surface's PTY.
 /// Returns true if bytes were written (false when the active mode does not
 /// report this event — e.g. motion in normal mode, or no tracking at all).
@@ -6992,7 +7136,7 @@ fn sendTerminalMouseReport(
     surface.render_state.mutex.lock();
     const mode = mouseReportEvent(surface.terminal.flags.mouse_event);
     const fmt = mouseReportFormat(surface.terminal.flags.mouse_format);
-    if (mode == .none) {
+    if (!mouse_dispatch.reporting.active(mode)) {
         surface.render_state.mutex.unlock();
         return false;
     }
@@ -7003,6 +7147,12 @@ fn sendTerminalMouseReport(
     if (len == 0) return false;
     writeToPty(surface, buf[0..len]);
     return true;
+}
+
+fn updateMouseCaptureCursor(x_i: i32, y_i: i32) void {
+    if (g_selecting or g_mouse_report.active() != null) return;
+    const surface = terminalContentSurfaceAt(x_i, y_i) orelse return;
+    platform_cursor.set(if (surfaceMouseReportingActive(surface)) .arrow else .ibeam);
 }
 
 /// True when the AI copilot sidebar is shown and covers (xf, yf).
@@ -7021,11 +7171,11 @@ fn aiCopilotRegionContains(xf: f64, yf: f64) bool {
         yf >= @as(f64, @floatFromInt(bounds.top)) and yf < @as(f64, @floatFromInt(bounds.bottom));
 }
 
-/// The surface that should receive a mouse report for an event at (x, y), or
-/// null when the point is over window chrome / side panels or the focused
-/// program has not enabled mouse tracking. Mirrors the chrome exclusions the
-/// left-press path walks before it reaches terminal content.
-fn terminalMouseReportTarget(x_i: i32, y_i: i32) ?*Surface {
+/// The surface under (x, y) when the point is over terminal content, or null
+/// when it is over window chrome / a side panel / an AI chat tab. This is the
+/// chrome-exclusion walk both the mouse-report gate and the mouse-capture
+/// cursor need, so it lives alone.
+fn terminalContentSurfaceAt(x_i: i32, y_i: i32) ?*Surface {
     const xf: f64 = @floatFromInt(x_i);
     const yf: f64 = @floatFromInt(y_i);
     if (yf < titlebarHeight()) return null; // titlebar
@@ -7035,11 +7185,17 @@ fn terminalMouseReportTarget(x_i: i32, y_i: i32) ?*Surface {
     if (hitTestBrowserUrlBar(xf, yf)) return null;
     if (hitTestBrowserPanel(xf, yf)) return null;
     if (aiCopilotRegionContains(xf, yf)) return null;
-    const surface = split_layout.surfaceAtPoint(x_i, y_i) orelse return null;
-    surface.render_state.mutex.lock();
-    const mode = surface.terminal.flags.mouse_event;
-    surface.render_state.mutex.unlock();
-    if (mode == .none) return null;
+    return split_layout.surfaceAtPoint(x_i, y_i);
+}
+
+/// The surface that should receive a mouse report for an event at (x, y), or
+/// null when the point is not terminal content, the user turned mouse
+/// reporting off, or the focused program has not enabled mouse tracking.
+/// Mirrors the chrome exclusions the left-press path walks before it reaches
+/// terminal content.
+fn terminalMouseReportTarget(x_i: i32, y_i: i32) ?*Surface {
+    const surface = terminalContentSurfaceAt(x_i, y_i) orelse return null;
+    if (!surfaceMouseReportingActive(surface)) return null;
     return surface;
 }
 
@@ -7278,7 +7434,7 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
     var sent_to_terminal = false;
 
     surface.render_state.mutex.lock();
-    if (surface.terminal.flags.mouse_event != .none) {
+    if (mouseReportingActiveLocked(surface)) {
         for (0..mouseWheelUnits(ev.delta)) |_| {
             if (!appendMouseWheelReport(surface, ev, &terminal_input_buf, &terminal_input_len)) break;
         }

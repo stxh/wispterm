@@ -49,6 +49,48 @@ pub fn pressShouldReport(mods: Mods) bool {
     return !mods.shift and !(mods.primary_open and !mods.alt);
 }
 
+/// The single gate for "may the terminal forward this mouse event to the
+/// focused program?". Mirrors Ghostty's `Surface.isMouseReporting()`:
+/// `config.mouse_reporting and terminal.flags.mouse_event != .none`.
+///
+/// `vt_mouse_event` is the VT's current request (?9/?1000/?1002/?1003, mapped
+/// through `mouseReportEvent`); `config_enabled` is the user's `mouse-reporting`
+/// setting. The config term is the escape hatch: `flags.mouse_event` lives in
+/// the terminal state and nothing clears it when a child program exits, so a
+/// TUI that enables tracking and then quits without sending the matching DECRST
+/// would otherwise keep the mouse forever.
+pub fn reportingActive(vt_mouse_event: mouse_report.Event, config_enabled: bool) bool {
+    return config_enabled and vt_mouse_event != .none;
+}
+
+/// The process-wide reporting gate. Owned by this feature module rather than a
+/// `g_*` monolith global, per src/source_guards/global_state_guard.zig: input
+/// state belongs in a state struct or a feature-owned module.
+pub const Reporting = struct {
+    /// Mirrors Ghostty's `mouse-reporting` config key (default true).
+    enabled: bool = true,
+
+    pub fn set(self: *Reporting, value: bool) void {
+        self.enabled = value;
+    }
+
+    /// Flip the gate and report the new value.
+    pub fn toggle(self: *Reporting) bool {
+        self.enabled = !self.enabled;
+        return self.enabled;
+    }
+
+    /// The full gate for one surface: the config term AND the VT's request.
+    pub fn active(self: Reporting, vt_mouse_event: mouse_report.Event) bool {
+        return reportingActive(vt_mouse_event, self.enabled);
+    }
+};
+
+/// The single reporting gate. Written by config load/reload (AppWindow) and by
+/// the `toggle_mouse_reporting` action; read by every mouse-report decision in
+/// input.zig. Threadlocal like the rest of the input layer's per-window state.
+pub threadlocal var reporting: Reporting = .{};
+
 /// A cell coordinate, used to deduplicate streamed drag-motion reports.
 pub const Cell = struct { col: usize, row: usize };
 
@@ -145,6 +187,46 @@ test "pressShouldReport: primary-open + alt still reports" {
 
 test "pressShouldReport: alt alone reports" {
     try std.testing.expect(pressShouldReport(.{ .alt = true }));
+}
+
+test "reportingActive: the VT request alone enables reporting" {
+    try std.testing.expect(reportingActive(.normal, true));
+    try std.testing.expect(reportingActive(.button, true));
+    try std.testing.expect(reportingActive(.any, true));
+    try std.testing.expect(reportingActive(.x10, true));
+}
+
+test "reportingActive: no VT request means no reporting" {
+    try std.testing.expect(!reportingActive(.none, true));
+}
+
+test "reportingActive: mouse-reporting=false overrides a stale VT request" {
+    // The escape hatch: a TUI that enabled tracking and exited without DECRST
+    // leaves the flag set forever, so the config must be able to win.
+    try std.testing.expect(!reportingActive(.any, false));
+    try std.testing.expect(!reportingActive(.normal, false));
+    try std.testing.expect(!reportingActive(.x10, false));
+    try std.testing.expect(!reportingActive(.none, false));
+}
+
+test "Reporting defaults to enabled and toggle reports the new value" {
+    var r = Reporting{};
+    try std.testing.expect(r.enabled);
+    try std.testing.expect(!r.toggle());
+    try std.testing.expect(!r.enabled);
+    try std.testing.expect(r.toggle());
+    try std.testing.expect(r.enabled);
+}
+
+test "Reporting.active combines the config gate with the VT request" {
+    var r = Reporting{};
+    try std.testing.expect(r.active(.any));
+    r.set(false);
+    try std.testing.expect(!r.active(.any));
+    // Re-enabling restores VT-driven behavior without touching the VT flag.
+    r.set(true);
+    try std.testing.expect(r.active(.any));
+    try std.testing.expect(!r.active(.none));
 }
 
 const TestSurface = struct { id: u32 };

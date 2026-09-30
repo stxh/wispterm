@@ -61,6 +61,7 @@ pub const CommandAction = enum {
     open_recipe,
     import_recipe,
     export_recipe,
+    toggle_mouse_reporting,
 };
 
 pub const CommandEntry = struct {
@@ -84,6 +85,11 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
     .{ .title = "Split Left", .detail = "Create a panel to the left", .shortcut = "", .action = .split_left },
     .{ .title = "Split Up", .detail = "Create a panel above", .shortcut = "", .action = .split_up },
+    // Escape hatch for a TUI that enabled mouse tracking (?1000/?1002/?1003) and
+    // exited without the matching DECRST: the flag lives in the VT state, so the
+    // terminal would keep forwarding clicks into a process that no longer reads
+    // them. Also bindable as `keybind = <chord>=toggle_mouse_reporting`.
+    .{ .title = "Toggle Mouse Reporting", .detail = "Forward mouse events to apps that request mouse tracking, or keep the mouse for selection and scrollback", .shortcut = "", .action = .toggle_mouse_reporting },
     // Previous/Next Panel removed from the palette (declutter); the Shift+Cmd+[ / ]
     // keybinds in keybind.zig still work — focus_previous/focus_next stay in the enum.
     .{ .title = "Equalize Panels", .detail = "Reset split sizes in the current tab", .shortcut = "", .action = .equalize_splits },
@@ -356,6 +362,10 @@ test "command center includes New Copilot action" {
 
 test "command center exposes Toggle Copilot" {
     try expectCommandEntry("Toggle Copilot", .toggle_ai_copilot);
+}
+
+test "command center exposes the mouse-reporting escape hatch" {
+    try expectCommandEntry("Toggle Mouse Reporting", .toggle_mouse_reporting);
 }
 
 test "command center includes Send to Chat action" {

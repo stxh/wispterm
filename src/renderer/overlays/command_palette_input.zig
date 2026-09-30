@@ -15,7 +15,18 @@ pub const Action = enum {
     cycle_history_source,
 };
 
+/// Map one key event to a palette action.
+///
+/// Ctrl/Alt/Super chords are deliberately NOT treated as palette navigation.
+/// The palette is a transient find-and-run surface, and a modified arrow
+/// (Ctrl+Up / Ctrl+Down / Alt+Up) is a terminal or TUI chord that the user
+/// expects to act on the program behind it — silently moving the palette's
+/// selection index instead is how "my hotkey got intercepted" bugs happen. The
+/// key is still consumed (`effectForAction` returns `.repaint` for `.noop`), so
+/// this only stops the *state mutation*, matching `charEffect` below. Shift
+/// stays allowed since Shift+Tab / Shift+Enter are palette chords.
 pub fn keyAction(ev: platform_input.KeyEvent, history_visible: bool) Action {
+    if (ev.ctrl or ev.alt or ev.super) return .noop;
     if (history_visible) {
         return switch (ev.key_code) {
             platform_input.key_escape => .leave_history,
@@ -86,4 +97,33 @@ test "command palette char input repaints only for plain text" {
     try std.testing.expect(charEffect(.{ .codepoint = 'a', .ctrl = false, .alt = false }).needs_rebuild);
     try std.testing.expect(!charEffect(.{ .codepoint = 'a', .ctrl = true, .alt = false }).needs_rebuild);
     try std.testing.expect(!charEffect(.{ .codepoint = 'a', .ctrl = false, .alt = true }).needs_rebuild);
+}
+
+test "command palette navigation ignores modifier chords" {
+    // Regression: Ctrl/Alt/Super + arrow used to move the palette selection,
+    // swallowing a chord meant for the terminal behind the palette.
+    inline for (.{
+        platform_input.KeyEvent{ .key_code = platform_input.key_up, .ctrl = true, .shift = false, .alt = false, .super = false },
+        platform_input.KeyEvent{ .key_code = platform_input.key_down, .ctrl = true, .shift = false, .alt = false, .super = false },
+        platform_input.KeyEvent{ .key_code = platform_input.key_up, .ctrl = false, .shift = false, .alt = true, .super = false },
+        platform_input.KeyEvent{ .key_code = platform_input.key_up, .ctrl = false, .shift = false, .alt = false, .super = true },
+    }) |ev| {
+        try std.testing.expectEqual(Action.noop, keyAction(ev, false));
+        try std.testing.expectEqual(Action.noop, keyAction(ev, true));
+    }
+}
+
+test "command palette still navigates on plain and shifted arrows" {
+    const plain = platform_input.KeyEvent{
+        .key_code = platform_input.key_up,
+        .ctrl = false,
+        .shift = false,
+        .alt = false,
+        .super = false,
+    };
+    try std.testing.expectEqual(Action.move_up, keyAction(plain, false));
+    try std.testing.expectEqual(Action.move_up, keyAction(plain, true));
+    var shifted = plain;
+    shifted.shift = true;
+    try std.testing.expectEqual(Action.move_up, keyAction(shifted, false));
 }

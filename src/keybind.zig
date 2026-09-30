@@ -103,6 +103,12 @@ pub const Action = enum {
     open_settings,
     open_config,
     send_to_copilot,
+    /// Flip the `mouse-reporting` gate: whether the terminal honors a focused
+    /// program's DECSET mouse-tracking request. Matches Ghostty's
+    /// `toggle_mouse_reporting`. Unbound by default (see `command_entries` in
+    /// src/command/center_state.zig for the command-center entry) so it can't
+    /// collide with a chord a TUI needs.
+    toggle_mouse_reporting,
 
     pub fn parse(value: []const u8) ?Action {
         inline for (std.meta.fields(Action)) |field| {

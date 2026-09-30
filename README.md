@@ -161,6 +161,7 @@ Use `keybind = clear` before custom bindings if you want to remove all defaults 
 | Copy terminal selection or AI Chat selection/transcript | **Ctrl+Shift+C** | **Cmd+C** |
 | Select from the last terminal click anchor | Shift-click terminal text | Shift-click terminal text |
 | Select terminal text while tmux mouse mode is enabled | **Shift-drag** | **Shift-drag** |
+| Toggle forwarding of mouse events to apps that request mouse tracking | Command center → "Toggle Mouse Reporting" (no default chord; bind with `keybind = <chord>=toggle_mouse_reporting`) | same |
 | Select part of an AI answer | Drag AI answer text | Drag AI answer text |
 | Select and copy part of an AI answer | Shift-drag AI answer text | Shift-drag AI answer text |
 | Select AI Chat input; select transcript when input is empty | **Ctrl+A** in AI Chat | **Cmd+A** in AI Chat |

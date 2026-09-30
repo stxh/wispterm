@@ -105,6 +105,7 @@ feishu-app-secret = your-app-secret
 | `focus-follows-mouse`       | `false`    | Focus whichever split panel the mouse is over, without clicking.                                                                                                                                                        |
 | `confirm-close-running-program` | `true` | Ask for confirmation before closing a panel or tab that is running a full-screen TUI (anything on the alternate screen, such as `vim` or `htop`).                                                                        |
 | `right-click-action`        | `copy`     | Right-click behavior in the terminal: `ignore`, `copy`, `paste`, or `copy-or-paste` (copy when a selection exists, otherwise paste).                                                                                   |
+| `mouse-reporting`           | `true`     | Forward mouse events to a program that requested mouse tracking (`?1000`/`?1002`/`?1003`). Set `false` to always keep the mouse for local selection, scrollback, and clipboard. Also toggled at runtime from the command center ("Toggle Mouse Reporting") or with `keybind = <chord>=toggle_mouse_reporting`. |
 | `copy-on-select`            | `false`    | Copy the terminal selection to the clipboard automatically as soon as you select it.                                                                                                                                    |
 | `ssh-legacy-algorithms`     | `false`    | Append compatibility options (`ssh-rsa`, old Diffie-Hellman KEX, CBC ciphers) for legacy SSH servers and bastions.                                                                                                      |
 | `windows-conpty`            | `auto`     | Windows console host: `auto` prefers the bundled modern ConPTY when `conpty.dll` + `OpenConsole.exe` sit next to `wispterm.exe` (shipped in the portable-compat package; restores TUI mouse support on old Windows 10); `system` forces the OS in-box ConPTY. |
@@ -126,6 +127,31 @@ For copy when selected and paste otherwise, configure:
 ```conf
 right-click-action = copy-or-paste
 ```
+
+### When a TUI exits and the mouse stops responding
+
+Mouse tracking is a terminal *state* flag, not a process handle. A TUI turns it
+on with `?1000`/`?1002`/`?1003` and is expected to turn it off with the matching
+DECRST on the way out. If it quits without doing so — a crash, a hard kill, or
+`os.Exit` — the flag stays set for the life of that surface, and WispTerm keeps
+forwarding clicks and wheel events into a program that no longer reads them.
+That looks like a dead mouse: the pointer highlights nothing, wheel scrolling
+stops, and middle-click paste does nothing. **Shift**-drag still selects,
+because WispTerm forces a plain-chord selection past the app.
+
+The cursor is the tell: WispTerm shows a text bar over terminal content while
+the terminal owns the mouse, and the default arrow while a program has captured
+it.
+
+To take the mouse back, run **Toggle Mouse Reporting** from the command center
+(or bind it, e.g. `keybind = ctrl+shift+m=toggle_mouse_reporting`), or set in
+the config file:
+
+```conf
+mouse-reporting = false
+```
+
+`reset` also clears it, since it re-initializes the terminal state.
 
 When `remote-enabled = true`, WispTerm creates one RemoteClient for the running
 instance. All tabs and splits publish PTY output through that shared client, and

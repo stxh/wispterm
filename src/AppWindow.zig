@@ -1,4 +1,4 @@
-﻿//! AppWindow — per-window state and rendering.
+//! AppWindow — per-window state and rendering.
 //!
 //! This module contains all the terminal rendering, input handling, and
 //! per-window state. Currently uses module-level globals for state, which
@@ -95,6 +95,8 @@ const cell_pipeline = @import("renderer/cell_pipeline.zig");
 pub const ui_pipeline = @import("renderer/ui_pipeline.zig");
 pub const titlebar = @import("renderer/titlebar.zig");
 pub const input = @import("input.zig");
+const mouse_dispatch = @import("input/mouse_dispatch.zig");
+const platform_cursor = @import("platform/cursor.zig");
 pub const overlays = @import("renderer/overlays.zig");
 const post_process = @import("renderer/post_process.zig");
 const d3d11_offscreen_smoke = @import("renderer/d3d11_offscreen_smoke.zig");
@@ -265,6 +267,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     // Split config
     overlays.g_unfocused_split_opacity = app.unfocused_split_opacity;
     g_focus_follows_mouse = app.focus_follows_mouse;
+    mouse_dispatch.reporting.set(app.mouse_reporting);
     g_copy_on_select = app.copy_on_select;
     g_copilot_hint = app.copilot_hint;
     g_right_click_action = app.right_click_action;
@@ -4361,6 +4364,10 @@ pub fn handleActiveSurfaceChangeWithinTab() void {
 
 fn clearUiStateOnTabChange() void {
     input.g_selecting = false;
+    // The reported-drag state holds a raw *Surface; leaving it set across a tab
+    // switch would stream motion to the previous tab's (possibly freed) surface
+    // and suppress local drag-selection in the new one.
+    input.cancelTerminalMouseReport();
     input.g_sidebar_resize_hover = false;
     input.g_sidebar_resize_dragging = false;
     input.g_explorer_resize_hover = false;
@@ -5112,6 +5119,9 @@ pub fn sweepExitedSurfaces() bool {
                     any_closed = true;
                     html_server.stopForSurfaceId(&surface_id);
                     input.g_selecting = false;
+                    // The surface this reported drag points at is about to be
+                    // freed by closeSplitAt; drop the cached pointer first.
+                    input.cancelTerminalMouseReport();
                     handleActiveSurfaceChangeWithinTab();
                     requestImmediateLayoutResize();
                 },
@@ -5250,6 +5260,21 @@ const ConfigWatcher = @import("config_watcher.zig");
 
 /// Focus follows mouse - when true, moving mouse into a split pane focuses it
 pub threadlocal var g_focus_follows_mouse: bool = false;
+
+/// Flip the `mouse-reporting` gate at runtime (Ghostty's
+/// `toggle_mouse_reporting`). Dropping the gate is the escape hatch for a TUI
+/// that enabled mouse tracking and exited without sending the matching DECRST:
+/// the VT flag would otherwise keep the mouse forever. The gate itself lives in
+/// the mouse feature module (input/mouse_dispatch.zig), not in a `g_*` global
+/// here. Also drops any in-progress reported drag so the pointer isn't left
+/// streaming to a program that no longer receives it, and repaints so the
+/// cursor shape follows.
+pub fn toggleMouseReporting() void {
+    _ = mouse_dispatch.reporting.toggle();
+    input.cancelTerminalMouseReport();
+    platform_cursor.set(.arrow);
+    markUiDirty();
+}
 pub threadlocal var g_copy_on_select: bool = false;
 pub threadlocal var g_copilot_hint: bool = true;
 threadlocal var g_copilot_shimmer_checked: bool = false;
@@ -5761,6 +5786,7 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     // --- Split config ---
     overlays.g_unfocused_split_opacity = cfg.@"unfocused-split-opacity";
     g_focus_follows_mouse = cfg.@"focus-follows-mouse";
+    mouse_dispatch.reporting.set(cfg.@"mouse-reporting");
     g_copy_on_select = cfg.@"copy-on-select";
     g_copilot_hint = cfg.@"copilot-hint";
     g_right_click_action = cfg.@"right-click-action";

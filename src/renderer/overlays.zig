@@ -882,6 +882,7 @@ fn executeCommand(action: CommandAction) void {
         .toggle_browser_panel => AppWindow.input.toggleBrowserPanel(),
         .open_jupyter_panel => AppWindow.input.openJupyterPanel(),
         .toggle_quake => AppWindow.toggleQuakeVisibility(),
+        .toggle_mouse_reporting => AppWindow.toggleMouseReporting(),
         .open_settings => settingsPageOpen(),
         .show_shortcuts => startupShortcutsShow(),
         .open_config => if (AppWindow.g_allocator) |alloc| Config.openConfigInEditor(alloc),
