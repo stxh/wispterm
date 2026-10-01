@@ -379,6 +379,9 @@ extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?HIMC;
+extern "imm32" fn ImmNotifyIME(hIMC: HIMC, dwAction: DWORD, dwIndex: DWORD, dwValue: ?*anyopaque) callconv(.winapi) BOOL;
+const NI_COMPOSITIONSTR: DWORD = 0x00000005;
+const CPS_CANCEL: DWORD = 0x00000002;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionWindow(hIMC: HIMC, lpCompForm: *COMPOSITIONFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCandidateWindow(hIMC: HIMC, lpCandidate: *CANDIDATEFORM) callconv(.winapi) BOOL;
@@ -1381,7 +1384,16 @@ pub const Window = struct {
                 self.should_close = true;
                 return false;
             }
-            _ = TranslateMessage(&msg);
+            // Do NOT hand a terminal chord to TranslateMessage. TranslateMessage
+            // is the hook a TSF/IMM IME uses to intercept keystrokes, and a
+            // Chinese IME in candidate mode claims Ctrl+Left/Ctrl+Right (and
+            // friends) for candidate navigation — so the key never reached the
+            // PTY as e.g. ESC [ 1;5C even though we encoded it correctly.
+            // Plain keys still go through so IME commit, dead keys, and
+            // AltGr (Ctrl+Alt) keep producing text.
+            if (shouldTranslateMessage(msg.message)) {
+                _ = TranslateMessage(&msg);
+            }
             _ = DispatchMessageW(&msg);
         }
         return !self.should_close;
@@ -1603,6 +1615,49 @@ fn getModifiers() struct { ctrl: bool, shift: bool, alt: bool } {
     };
 }
 
+/// True when a WM_KEYDOWN for this keystroke is a terminal chord rather than
+/// text input, so it must never be offered to the IME via TranslateMessage.
+///
+/// This is the same modifier rule `dispatchKey`/`handleChar` already use
+/// (`input.zig`: `if (ev.alt and !ev.ctrl) return .none;` — AltGr reports as
+/// Ctrl+Alt and must still produce text). Super is added on top because a
+/// command chord is never text on any layout.
+fn isTerminalChordKeystroke() bool {
+    const mods = getModifiers();
+    if (mods.ctrl) return true;
+    if (mods.alt and !mods.ctrl) return true;
+    return (GetKeyState(@intCast(VK_LWIN)) & KEY_PRESSED) != 0 or
+        (GetKeyState(@intCast(VK_RWIN)) & KEY_PRESSED) != 0;
+}
+
+/// Whether this message may be passed to TranslateMessage.
+///
+/// Everything except a key-down that carries a terminal chord. Pure over the
+/// message id + the "is this a chord" predicate so the rule is unit-testable
+/// without a live window or live modifier state.
+fn shouldTranslateMessageFor(message: u32, key_down_is_chord: bool) bool {
+    if (message != WM_KEYDOWN and message != WM_SYSKEYDOWN) return true;
+    return !key_down_is_chord;
+}
+
+fn shouldTranslateMessage(message: u32) bool {
+    const is_key_down = message == WM_KEYDOWN or message == WM_SYSKEYDOWN;
+    return shouldTranslateMessageFor(message, is_key_down and isTerminalChordKeystroke());
+}
+
+/// Ask the IME to abandon any in-flight composition and drop our preedit
+/// cache. Called when a terminal chord arrives: a live composition would
+/// otherwise swallow the chord (the IME commits on most keys) and, worse,
+/// leave our rendered preedit out of sync with the IME's.
+fn cancelImeComposition(w: *Window) void {
+    if (!w.ime_composing) return;
+    if (ImmGetContext(w.hwnd)) |hIMC| {
+        _ = ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL, null);
+        _ = ImmReleaseContext(w.hwnd, hIMC);
+    }
+    w.clearImePreedit();
+}
+
 fn pushMouseButtonEvent(w: *Window, button: MouseButton, action: MouseButtonAction, x: i32, y: i32) void {
     const mods = getModifiers();
     w.mouse_button_events.push(.{
@@ -1669,6 +1724,23 @@ test "win32 IME composition handles result and preedit flags independently" {
     const result_only = imeCompositionActions(@as(LPARAM, @intCast(GCS_RESULTSTR)));
     try std.testing.expect(result_only.push_result);
     try std.testing.expect(!result_only.update_preedit);
+}
+
+// Regression: TranslateMessage is the hook a TSF/IMM IME uses to intercept
+// keystrokes. Passing a terminal chord through it let a Chinese IME in
+// candidate mode swallow Ctrl+Left / Ctrl+Right for candidate navigation, so
+// the key never reached the PTY as ESC [ 1;5C.
+test "win32 TranslateMessage is skipped for terminal chords only" {
+    // A chord key-down is NOT translated: no IME gets a shot at it.
+    try std.testing.expect(!shouldTranslateMessageFor(WM_KEYDOWN, true));
+    try std.testing.expect(!shouldTranslateMessageFor(WM_SYSKEYDOWN, true));
+    // A plain key-down still is, so IME commit / dead keys keep working.
+    try std.testing.expect(shouldTranslateMessageFor(WM_KEYDOWN, false));
+    try std.testing.expect(shouldTranslateMessageFor(WM_SYSKEYDOWN, false));
+    // Non-key messages are never affected by modifier state.
+    try std.testing.expect(shouldTranslateMessageFor(WM_CHAR, true));
+    try std.testing.expect(shouldTranslateMessageFor(WM_IME_COMPOSITION, true));
+    try std.testing.expect(shouldTranslateMessageFor(0x0012, true));
 }
 
 test "win32 IME caret sync dedup includes normalized caret and client size" {
@@ -2214,6 +2286,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         // --- Keyboard input ---
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             const mods = getModifiers();
+            // A terminal chord must reach the PTY, not the IME. Abandon any
+            // live composition first: the IME commits on most keys, so a
+            // composition left open would consume the chord and desync our
+            // rendered preedit from the IME's.
+            if (mods.ctrl or mods.alt or (GetKeyState(@intCast(VK_LWIN)) & KEY_PRESSED) != 0 or
+                (GetKeyState(@intCast(VK_RWIN)) & KEY_PRESSED) != 0)
+            {
+                cancelImeComposition(w);
+            }
             w.key_events.push(.{
                 .key_code = wParam,
                 .ctrl = mods.ctrl,
