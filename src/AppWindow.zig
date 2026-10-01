@@ -106,6 +106,7 @@ const d3d11_fallback_marker = @import("renderer/gpu/d3d11/fallback_marker.zig");
 pub const gpu = @import("renderer/gpu/gpu.zig");
 pub const split_layout = @import("appwindow/split_layout.zig");
 const render_gate = @import("appwindow/render_gate.zig");
+const exit_sweep = @import("appwindow/exit_sweep.zig");
 const frame_scheduler = @import("appwindow/frame_scheduler.zig");
 const frame_latency = @import("appwindow/frame_latency.zig");
 const flush_scheduler = @import("appwindow/flush_scheduler.zig");
@@ -5064,6 +5065,13 @@ pub fn closeFocusedSplit() void {
 /// process (bash/powershell/ssh) exits, the pane/tab/window is closed
 /// automatically instead of staying open showing "Press Enter to reconnect".
 ///
+/// A pane is only destroyed once the OS has *proven* its child exited (see
+/// `exit_sweep.shouldAutoClose`). `Surface.isExited()` alone is not enough: the
+/// IO layer also reports exit for a transient read failure or a spurious PTY
+/// end-of-stream, and closing on those destroyed live tabs — a shell would
+/// come back to its prompt (e.g. after a foreground TUI such as `opencode`
+/// exited) only for the tab to disappear under it.
+///
 /// Virtual panes (tmux control-mode) and non-terminal tabs are skipped.
 /// Returns true if any pane was closed (caller should redraw).
 pub fn sweepExitedSurfaces() bool {
@@ -5087,18 +5095,23 @@ pub fn sweepExitedSurfaces() bool {
         var close_count: usize = 0;
         var it = t.tree.surfaces();
         while (it.next()) |entry| {
-            // If the read thread hasn't detected exit yet (it may be blocked
-            // on ReadFile if ConPTY hasn't closed the pipe), poll the process
-            // handle directly. On Windows the child can exit while the PTY
-            // output pipe stays open.
-            if (!entry.surface.isExited() and entry.surface.command.hasProcess()) {
+            // The child can exit while the PTY output pipe stays open (on
+            // Windows the ConPTY pipe outlives the child), so poll the process
+            // handle every sweep. A non-null status is the only trustworthy
+            // proof of exit; `Surface.pollExitStatus` records it as the
+            // surface's `childExitConfirmed`. This poll must not be gated on
+            // `isExited()`: a surface that failed IO (`.failed`) still needs
+            // its proof recorded before it may be closed.
+            if (entry.surface.command.hasProcess()) {
                 if (entry.surface.pollExitStatus()) |status| {
                     entry.surface.markExited(.eof, status);
                 }
             }
-            const exited = entry.surface.isExited();
-            const has_proc = entry.surface.command.hasProcess();
-            if (exited and has_proc) {
+            if (exit_sweep.shouldAutoClose(.{
+                .io_reported_exit = entry.surface.isExited(),
+                .has_child_process = entry.surface.command.hasProcess(),
+                .child_exit_confirmed = entry.surface.childExitConfirmed(),
+            })) {
                 if (close_count < MaxClose) {
                     to_close_handles[close_count] = entry.handle;
                     to_close_ids[close_count] = entry.surface.remote_id;

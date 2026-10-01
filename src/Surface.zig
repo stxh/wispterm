@@ -291,6 +291,10 @@ exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// stop flag; this carries the reason surfaced to callers and UI.
 io_state_mutex: std.Thread.Mutex = .{},
 io_state: IoState = .starting,
+/// Set when a `Command.wait` call returned an exit status, i.e. the OS proved
+/// the child is gone. Guarded by `io_state_mutex`; reset by `respawn` because
+/// the fresh child has not exited yet.
+child_exit_confirmed: bool = false,
 
 /// SSH password autofill timing. When an SSH session (re)connects the saved
 /// password is typed once the remote password prompt appears. Per-surface (not
@@ -797,6 +801,25 @@ pub fn isExited(self: *Surface) bool {
     };
 }
 
+/// True once the OS has confirmed this surface's child process exited (a
+/// `Command.wait` call returned an exit status). This is deliberately separate
+/// from `isExited`: the IO layer also reports exit for reasons that prove
+/// nothing about the child — a transient read failure, or a spurious end-of-
+/// stream from the PTY backend while the shell is still running. The
+/// close-on-exit sweep requires this proof so a live tab is never destroyed by
+/// a backend hiccup.
+pub fn childExitConfirmed(self: *Surface) bool {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    return self.child_exit_confirmed;
+}
+
+fn markChildExitConfirmed(self: *Surface) void {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    self.child_exit_confirmed = true;
+}
+
 /// Whether this existing surface can be restarted in place. The original
 /// command and identity stay attached to the same tab/split.
 pub fn canRespawn(self: *Surface) bool {
@@ -833,13 +856,16 @@ pub fn markStopped(self: *Surface) void {
 }
 
 pub fn pollExitStatus(self: *Surface) ?Command.Exit {
-    return self.command.wait(false) catch |err| {
+    const status = self.command.wait(false) catch |err| {
         io_log.warn("process exit poll failed err={s}", .{@errorName(err)});
         return null;
     };
+    if (status != null) self.markChildExitConfirmed();
+    return status;
 }
 
 pub fn markExited(self: *Surface, reason: ExitReason, status: ?Command.Exit) void {
+    if (status != null) self.markChildExitConfirmed();
     const info: ExitInfo = .{
         .reason = reason,
         .status = status,
@@ -1051,6 +1077,9 @@ pub fn respawn(self: *Surface) void {
     self.exited.store(false, .release);
     self.io_state_mutex.lock();
     self.io_state = .starting;
+    // The old child's exit proof must not carry over: the sweep would read it
+    // as proof that the freshly spawned child had already exited.
+    self.child_exit_confirmed = false;
     self.io_state_mutex.unlock();
 
     // ponytail: thread-spawn failure after the swap marks the surface failed

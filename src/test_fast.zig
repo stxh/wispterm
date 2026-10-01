@@ -299,6 +299,7 @@ test {
     _ = @import("apprt/window_drag_region.zig");
     _ = @import("apprt/window_registry.zig");
     _ = @import("appwindow/active_tab.zig");
+    _ = @import("appwindow/exit_sweep.zig");
     _ = @import("appwindow/frame_latency.zig");
     _ = @import("appwindow/frame_scheduler.zig");
     _ = @import("appwindow/png_writer.zig");
